@@ -1,14 +1,16 @@
 // ==UserScript==
-// @name         AMES 自定义工卡打开手册
+// @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.11.1
-// @description  AMES 工卡手册打开、工程文件评估快捷查询增强
+// @version      1.12.0
+// @description  AMES 工卡/工程评估增强、AirNavX 自动处理、Boeing Toolbox 自动继续
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
+// @match        https://airnavx.juneyaoair.com/airnavx*
+// @match        http://boeingtoolbox.juneyaoair.com:8080/toolboxremote.html*
 // @updateURL    https://raw.githubusercontent.com/amiaopet/ames/main/ames-airnavx-open-manual.user.js
 // @downloadURL  https://raw.githubusercontent.com/amiaopet/ames/main/ames-airnavx-open-manual.user.js
-// @grant        none
-// @run-at       document-idle
+// @grant        unsafeWindow
+// @run-at       document-start
 // ==/UserScript==
 
 (function () {
@@ -759,7 +761,51 @@
     };
   }
 
-  function start() {
+  function waitForElement(selector, timeout = 30000) {
+    return new Promise((resolve, reject) => {
+      const found = document.querySelector(selector);
+      if (found) {
+        resolve(found);
+        return;
+      }
+
+      const observer = new MutationObserver(() => {
+        const element = document.querySelector(selector);
+        if (element) {
+          observer.disconnect();
+          resolve(element);
+        }
+      });
+
+      observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true
+      });
+
+      window.setTimeout(() => {
+        observer.disconnect();
+        reject(new Error(`Timeout waiting for ${selector}`));
+      }, timeout);
+    });
+  }
+
+  function setNativeInputValue(input, value) {
+    const proto = input instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype
+      : HTMLInputElement.prototype;
+    const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+
+    if (descriptor && descriptor.set) {
+      descriptor.set.call(input, value);
+    } else {
+      input.value = value;
+    }
+
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function startAmesEnhancements() {
     enhanceTables();
 
     const scheduleEnhance = debounce(enhanceTables, 250);
@@ -772,9 +818,375 @@
     window.setInterval(enhanceTables, 1500);
   }
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', start, { once: true });
-  } else {
-    start();
+  function runWhenDomReady(callback) {
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', callback, { once: true });
+    } else {
+      callback();
+    }
+  }
+
+  function runBoeingToolboxAutoContinue() {
+    const targetHash = '#/ap/64312';
+    const password = '84510';
+    let hasClickedContinue = false;
+
+    async function run() {
+      if (location.hash !== targetHash) {
+        return;
+      }
+      if (hasClickedContinue) {
+        return;
+      }
+
+      const acceptIcon = await waitForElement('#tb_btn_accpt_lic_agrmnt');
+      if (!acceptIcon.className.includes('fa-check-square-o')) {
+        acceptIcon.click();
+      }
+
+      const passwordInput = await waitForElement('.modal-footer-custom input');
+      setNativeInputValue(passwordInput, password);
+
+      const continueButton = await waitForElement('#button1');
+      hasClickedContinue = true;
+      continueButton.click();
+    }
+
+    runWhenDomReady(() => run().catch(console.error));
+
+    window.addEventListener('hashchange', () => {
+      hasClickedContinue = false;
+      run().catch(console.error);
+    });
+  }
+
+  function runAirNavEnhancements() {
+    const win = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+    const pnTag = '[AirNav PN]';
+    const patchedFlag = Symbol('airnavPnPatched');
+    const accessCode = '73409';
+    const accessCodeSelector = 'input.access-code[name="access-code"], input[name="access-code"]';
+    let hasSubmittedAccessCode = false;
+
+    function formatPN(value) {
+      if (typeof value !== 'string') {
+        return value;
+      }
+      if (/^\d{6}-\d{2}$/.test(value)) {
+        return value;
+      }
+      return value.replace(/^(\d{2})(\d{2})(\d{2})(-.*)$/, '$1-$2-$3$4');
+    }
+
+    function formatSearchParams(params) {
+      if (!params || !params.has('q')) {
+        return false;
+      }
+
+      const oldValue = params.get('q');
+      const newValue = formatPN(oldValue);
+      if (newValue === oldValue) {
+        return false;
+      }
+
+      params.set('q', newValue);
+      return true;
+    }
+
+    function formatUrl(value) {
+      if (typeof value !== 'string') {
+        return value;
+      }
+
+      try {
+        const url = new URL(value, win.location.href);
+        if (!/\/airnavx\//.test(url.pathname)) {
+          return value;
+        }
+        if (!formatSearchParams(url.searchParams)) {
+          return value;
+        }
+        return url.href;
+      } catch (error) {
+        return value.replace(/([?&]q=)([^&#]*)/, (_, prefix, q) => {
+          const decoded = decodeURIComponent(q.replace(/\+/g, ' '));
+          const formatted = formatPN(decoded);
+          return formatted === decoded ? prefix + q : prefix + encodeURIComponent(formatted);
+        });
+      }
+    }
+
+    const initialUrl = formatUrl(win.location.href);
+    if (initialUrl !== win.location.href) {
+      win.location.replace(initialUrl);
+      return;
+    }
+
+    function normalizeInput(input) {
+      if (!input || typeof input.value !== 'string') {
+        return false;
+      }
+
+      const oldValue = input.value;
+      const newValue = formatPN(oldValue);
+      if (newValue === oldValue) {
+        return false;
+      }
+
+      setNativeInputValue(input, newValue);
+      console.log(pnTag, 'input:', oldValue, '=>', newValue);
+      return true;
+    }
+
+    function findSearchInputs(root) {
+      const doc = root && root.querySelectorAll ? root : document;
+      return Array.from(doc.querySelectorAll([
+        'input.searchBarFullWidth',
+        'input[ng-model="SearchBarCtrl.searchText"]',
+        'input[placeholder*="Search on your content"]',
+        'input[placeholder*="Search by Part Number"]',
+        'textarea'
+      ].join(',')));
+    }
+
+    function normalizeActiveOrSearchInputs() {
+      const active = document.activeElement;
+      if (active && /^(INPUT|TEXTAREA)$/.test(active.tagName) && normalizeInput(active)) {
+        return true;
+      }
+      return findSearchInputs(document).some(normalizeInput);
+    }
+
+    function patchDomEvents() {
+      document.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.keyCode === 13) {
+          normalizeActiveOrSearchInputs();
+        }
+      }, true);
+
+      document.addEventListener('click', (event) => {
+        const target = event.target;
+        const button = target && target.closest && target.closest(
+          'button.search-button, button[aria-label="Search"], .search-button button, md-button[aria-label="Search"]'
+        );
+        if (button) {
+          normalizeActiveOrSearchInputs();
+        }
+      }, true);
+
+      document.addEventListener('blur', (event) => {
+        if (event.target && /^(INPUT|TEXTAREA)$/.test(event.target.tagName)) {
+          normalizeInput(event.target);
+        }
+      }, true);
+
+      document.addEventListener('paste', (event) => {
+        const target = event.target;
+        if (target && /^(INPUT|TEXTAREA)$/.test(target.tagName)) {
+          window.setTimeout(() => normalizeInput(target), 0);
+        }
+      }, true);
+    }
+
+    function patchHistory() {
+      ['pushState', 'replaceState'].forEach((name) => {
+        const original = win.history && win.history[name];
+        if (!original || original[patchedFlag]) {
+          return;
+        }
+
+        win.history[name] = function patchedHistory(state, title, url) {
+          if (typeof url === 'string') {
+            url = formatUrl(url);
+          }
+          return original.call(this, state, title, url);
+        };
+        win.history[name][patchedFlag] = true;
+      });
+    }
+
+    function patchNetwork() {
+      if (win.fetch && !win.fetch[patchedFlag]) {
+        const originalFetch = win.fetch;
+        win.fetch = function patchedFetch(resource, init) {
+          if (typeof resource === 'string') {
+            resource = formatUrl(resource);
+          } else if (resource && typeof resource.url === 'string') {
+            const nextUrl = formatUrl(resource.url);
+            if (nextUrl !== resource.url) {
+              resource = new Request(nextUrl, resource);
+            }
+          }
+          return originalFetch.call(this, resource, init);
+        };
+        win.fetch[patchedFlag] = true;
+      }
+
+      if (win.XMLHttpRequest && win.XMLHttpRequest.prototype.open && !win.XMLHttpRequest.prototype.open[patchedFlag]) {
+        const originalOpen = win.XMLHttpRequest.prototype.open;
+        win.XMLHttpRequest.prototype.open = function patchedOpen(method, url) {
+          if (typeof url === 'string') {
+            arguments[1] = formatUrl(url);
+          }
+          return originalOpen.apply(this, arguments);
+        };
+        win.XMLHttpRequest.prototype.open[patchedFlag] = true;
+      }
+    }
+
+    function patchFunction(object, key, wrapper) {
+      if (!object || typeof object[key] !== 'function' || object[key][patchedFlag]) {
+        return false;
+      }
+
+      const original = object[key];
+      object[key] = wrapper(original);
+      object[key][patchedFlag] = true;
+      return true;
+    }
+
+    function patchAngular(injector) {
+      try {
+        const searchService = injector.get('SearchService');
+        patchFunction(searchService, 'doSearch', (original) => {
+          return function patchedDoSearch(page, mode, text, ...rest) {
+            return original.call(this, page, mode, formatPN(text), ...rest);
+          };
+        });
+
+        const searchModel = injector.get('SearchModel');
+        if (searchModel && searchModel.searchText) {
+          patchFunction(searchModel.searchText, 'set', (original) => {
+            return function patchedSearchTextSet(value) {
+              return original.call(this, formatPN(value));
+            };
+          });
+        }
+
+        const rootScope = injector.get('$rootScope');
+        patchFunction(rootScope, '$broadcast', (original) => {
+          return function patchedBroadcast(name, payload, ...rest) {
+            if ((name === 'search-action' || name === 'clear-search-action') && Array.isArray(payload)) {
+              payload = payload.map((item) => {
+                return item && item.code === 'q'
+                  ? Object.assign({}, item, { value: formatPN(item.value) })
+                  : item;
+              });
+            }
+            return original.call(this, name, payload, ...rest);
+          };
+        });
+
+        return true;
+      } catch (error) {
+        return false;
+      }
+    }
+
+    function getInjector() {
+      const angular = win.angular;
+      if (!angular || !angular.element) {
+        return null;
+      }
+
+      const candidates = [
+        document.body,
+        document.documentElement,
+        document.querySelector('[ng-app]'),
+        document.querySelector('[data-ng-app]'),
+        document.querySelector('.ng-scope')
+      ].filter(Boolean);
+
+      for (const element of candidates) {
+        try {
+          const injector = angular.element(element).injector && angular.element(element).injector();
+          if (injector) {
+            return injector;
+          }
+        } catch (error) {
+          // Keep polling until Angular finishes booting.
+        }
+      }
+      return null;
+    }
+
+    function waitForAngular() {
+      const injector = getInjector();
+      if (injector && patchAngular(injector)) {
+        return;
+      }
+      window.setTimeout(waitForAngular, 100);
+    }
+
+    function hasAccessCodeError() {
+      return new URL(window.location.href).searchParams.has('ace');
+    }
+
+    function submitAccessCodeForm(form) {
+      hasSubmittedAccessCode = true;
+      try {
+        sessionStorage.clear();
+        sessionStorage.setItem('airnav-access-code-autofill-submitted', '1');
+      } catch (error) {
+        // Ignore storage failures; the in-memory guard still prevents repeats on this page.
+      }
+
+      HTMLFormElement.prototype.submit.call(form);
+    }
+
+    function fillAccessCode() {
+      const input = document.querySelector(accessCodeSelector);
+      if (!input || input.type === 'hidden') {
+        return false;
+      }
+
+      const form = input.form || document.querySelector('form[action*="set-access-code"]');
+      if (!form) {
+        return false;
+      }
+
+      if (input.value !== accessCode) {
+        setNativeInputValue(input, accessCode);
+      }
+
+      if (!hasSubmittedAccessCode && !hasAccessCodeError()) {
+        window.setTimeout(() => {
+          if (!hasSubmittedAccessCode && document.contains(input)) {
+            submitAccessCodeForm(form);
+          }
+        }, 300);
+      }
+
+      return true;
+    }
+
+    function startAccessCodeAutoFill() {
+      if (fillAccessCode()) {
+        return;
+      }
+
+      const observer = new MutationObserver(() => {
+        if (fillAccessCode()) {
+          observer.disconnect();
+        }
+      });
+
+      observer.observe(document.documentElement, { childList: true, subtree: true });
+      window.setTimeout(() => observer.disconnect(), 15000);
+    }
+
+    patchDomEvents();
+    patchHistory();
+    patchNetwork();
+    waitForAngular();
+    runWhenDomReady(startAccessCodeAutoFill);
+  }
+
+  if (location.hostname === 'ames.juneyaoair.com') {
+    runWhenDomReady(startAmesEnhancements);
+  } else if (location.hostname === 'boeingtoolbox.juneyaoair.com') {
+    runBoeingToolboxAutoContinue();
+  } else if (location.hostname === 'airnavx.juneyaoair.com') {
+    runAirNavEnhancements();
   }
 })();
