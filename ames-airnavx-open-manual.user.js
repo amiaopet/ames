@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AMES 自定义工卡打开手册
 // @namespace    https://juneyaoair.com/
-// @version      1.10.1
+// @version      1.11.1
 // @description  AMES 工卡手册打开、工程文件评估快捷查询增强
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
@@ -19,6 +19,7 @@
   const EVAL_PREVIOUS_BUTTON_CLASS = 'airnavx-eval-previous';
   const EVAL_TOOL_BUTTON_CLASS = 'airnavx-eval-tool-button';
   const EVAL_RETURN_STATE_KEY = '__airnavxEngineeringEvalReturnState';
+  const EVAL_CURRENT_USER_NAME_KEY = '__airnavxEngineeringEvalCurrentUserName';
   const SEARCH_BASE = 'https://airnavx.juneyaoair.com/airnavx/search/text?q=';
   const REFERENCE_HEADERS = ['参考资料', '参考手册'];
   const MIN_REFERENCE_WIDTH = 210;
@@ -37,6 +38,20 @@
     'evaManName',
     'evaResult',
     'ifAgainEva'
+  ];
+  const USER_NAME_SELECTORS = [
+    '#userName',
+    '#username',
+    '.J_userName',
+    '.user-name',
+    '.username',
+    '.user-info',
+    '.userInfo',
+    '.dropdown-user',
+    '.navbar-top-links .dropdown-toggle',
+    '.navbar-right .dropdown-toggle',
+    '.profile-element .block',
+    '.login-user'
   ];
 
   function cleanText(value) {
@@ -433,6 +448,61 @@
     }
   }
 
+  function normalizePersonName(value) {
+    const text = cleanText(value)
+      .replace(/^(当前用户|登录人|用户|姓名|欢迎|您好|你好)[：:，,\s]*/, '')
+      .replace(/(退出|注销|修改密码|个人中心).*$/, '')
+      .trim();
+
+    if (/^[\u4e00-\u9fa5·]{2,6}$/.test(text) &&
+      !['首页', '用户', '个人中心', '工程文件评估'].includes(text)) {
+      return text;
+    }
+
+    const labeledMatch = cleanText(value).match(/(?:当前用户|登录人|用户|姓名|欢迎|您好|你好)[：:，,\s]*([\u4e00-\u9fa5·]{2,6})/);
+    return labeledMatch ? labeledMatch[1] : '';
+  }
+
+  function getLoggedInUserName(targetDocument) {
+    try {
+      const topDocument = targetDocument.defaultView.top.document;
+      for (const selector of USER_NAME_SELECTORS) {
+        const nodes = Array.from(topDocument.querySelectorAll(selector)).slice(0, 8);
+        for (const node of nodes) {
+          const name = normalizePersonName(node.textContent);
+          if (name) {
+            return name;
+          }
+        }
+      }
+    } catch (error) {
+      // Fall back to the current page's default evaluator field.
+    }
+
+    return '';
+  }
+
+  function cacheEngineeringCurrentUserName(targetDocument) {
+    const targetWindow = targetDocument.defaultView || window;
+    if (targetWindow[EVAL_CURRENT_USER_NAME_KEY]) {
+      return targetWindow[EVAL_CURRENT_USER_NAME_KEY];
+    }
+
+    const loggedInName = getLoggedInUserName(targetDocument);
+    const defaultEvaluatorName = normalizePersonName(getFieldValue(targetDocument, 'evaManName'));
+    const userName = loggedInName || defaultEvaluatorName;
+
+    if (userName) {
+      targetWindow[EVAL_CURRENT_USER_NAME_KEY] = userName;
+    }
+
+    return userName;
+  }
+
+  function getEngineeringCurrentUserName(targetDocument) {
+    return cacheEngineeringCurrentUserName(targetDocument);
+  }
+
   function captureEngineeringSearchState(targetDocument) {
     return EVAL_SEARCH_FIELD_IDS.reduce((state, fieldId) => {
       state[fieldId] = getFieldValue(targetDocument, fieldId);
@@ -587,7 +657,13 @@
     myEvaluationButton.addEventListener('click', (event) => {
       event.preventDefault();
       event.stopPropagation();
-      runEngineeringSearch(targetDocument, { evaManName: '马士航' });
+      const currentUserName = getEngineeringCurrentUserName(targetDocument);
+      if (currentUserName) {
+        runEngineeringSearch(targetDocument, { evaManName: currentUserName });
+        return;
+      }
+
+      targetDocument.defaultView.alert('未能识别当前登录人');
     });
 
     exportButton.insertAdjacentElement('afterend', myEvaluationButton);
@@ -601,6 +677,7 @@
     }
 
     addEngineeringToolbarButtons(targetDocument);
+    cacheEngineeringCurrentUserName(targetDocument);
     enhanceEngineeringEvaluationRows(targetDocument);
   }
 
