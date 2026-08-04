@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.12.0
+// @version      1.12.1
 // @description  AMES 工卡/工程评估增强、AirNavX 自动处理、Boeing Toolbox 自动继续
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
 // @match        https://airnavx.juneyaoair.com/airnavx*
+// @match        http://airnav.juneyaoair.com:8000/*
 // @match        http://boeingtoolbox.juneyaoair.com:8080/toolboxremote.html*
 // @updateURL    https://raw.githubusercontent.com/amiaopet/ames/main/ames-airnavx-open-manual.user.js
 // @downloadURL  https://raw.githubusercontent.com/amiaopet/ames/main/ames-airnavx-open-manual.user.js
@@ -1186,7 +1187,7 @@
     runWhenDomReady(startAmesEnhancements);
   } else if (location.hostname === 'boeingtoolbox.juneyaoair.com') {
     runBoeingToolboxAutoContinue();
-  } else if (location.hostname === 'airnavx.juneyaoair.com') {
+  } else if (location.hostname === 'airnavx.juneyaoair.com' || location.host === 'airnav.juneyaoair.com:8000') {
     runAirNavEnhancements();
   }
 })();
