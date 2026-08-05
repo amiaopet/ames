@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.13.5
+// @version      1.13.6
 // @description  AMES 工卡/工程评估增强、AirNavX 自动处理、Boeing Toolbox 自动继续
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
@@ -1266,14 +1266,10 @@
   }
 
   function runBoeingToolboxAutoContinue() {
-    const targetHash = '#/ap/64312';
     const password = '84510';
     let hasClickedContinue = false;
 
     async function run() {
-      if (location.hash !== targetHash) {
-        return;
-      }
       if (hasClickedContinue) {
         return;
       }
