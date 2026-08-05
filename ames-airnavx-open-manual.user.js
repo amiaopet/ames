@@ -1,16 +1,20 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.12.1
+// @version      1.13.5
 // @description  AMES 工卡/工程评估增强、AirNavX 自动处理、Boeing Toolbox 自动继续
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
+// @match        https://mashihang.moonpet.cc/*
 // @match        https://airnavx.juneyaoair.com/airnavx*
 // @match        http://airnav.juneyaoair.com:8000/*
 // @match        http://boeingtoolbox.juneyaoair.com:8080/toolboxremote.html*
 // @updateURL    https://raw.githubusercontent.com/amiaopet/ames/main/ames-airnavx-open-manual.user.js
 // @downloadURL  https://raw.githubusercontent.com/amiaopet/ames/main/ames-airnavx-open-manual.user.js
 // @grant        unsafeWindow
+// @grant        GM_xmlhttpRequest
+// @connect      ames.juneyaoair.com
+// @connect      10.14.122.12
 // @run-at       document-start
 // ==/UserScript==
 
@@ -23,7 +27,11 @@
   const EVAL_TOOL_BUTTON_CLASS = 'airnavx-eval-tool-button';
   const EVAL_RETURN_STATE_KEY = '__airnavxEngineeringEvalReturnState';
   const EVAL_CURRENT_USER_NAME_KEY = '__airnavxEngineeringEvalCurrentUserName';
+  const AMES_BASE = 'https://ames.juneyaoair.com';
+  const FILE_QUICK_BASE = 'http://10.14.122.12:7080';
   const SEARCH_BASE = 'https://airnavx.juneyaoair.com/airnavx/search/text?q=';
+  const TOOLBOX_BASE = 'https://mashihang.moonpet.cc';
+  const TOOLBOX_HOST = 'mashihang.moonpet.cc';
   const REFERENCE_HEADERS = ['参考资料', '参考手册'];
   const MIN_REFERENCE_WIDTH = 210;
   const MAX_REFERENCE_WIDTH = 320;
@@ -56,6 +64,140 @@
     '.profile-element .block',
     '.login-user'
   ];
+  const TOOLBOX_ITEMS = [
+    { text: '知识检索', path: '/knowledge-base', tone: 'knowledge' },
+    { text: '件序号装机监控', path: '/part-serial-monitor', tone: 'monitor' },
+    { text: '飞机主数据', path: '/aircraft-master-data', tone: 'data' },
+    { text: '一键转发工卡', path: '/jobcard-forward', withAmesCookie: true, cookieTool: 'jobcard-forward', tone: 'jobcard' },
+    { text: '工卡完工查询', path: '/jobcard-completion', tone: 'jobcard' },
+    { text: '工卡xml下载', path: '/jobcard-xml-download', tone: 'xml' },
+    { text: '手册升版', path: '/manual-revision', withAmesCookie: true, cookieTool: 'manual-revision', tone: 'manual' },
+    { text: '工卡XML翻译', path: '/jobcard-xml-translate', tone: 'xml' },
+    { text: '修理报告下载', path: '/repair-report-download', tone: 'report' },
+    { text: '评估文件查询', path: '/file-evaluation-search', tone: 'eval' },
+    { text: '文件快速评估', path: '/file-quick-evaluation', withAmesCookie: true, cookieTool: 'file-quick-evaluation', tone: 'eval' },
+    { text: '320MOD查询', path: '/a320-mod-search', tone: 'query' },
+    { text: 'TR下载', path: '/tr-download', tone: 'download' }
+  ];
+  const TOOLBOX_BRIDGE_ALLOWED_PATHS = new Set([
+    '/api/v1/system/data/menu',
+    '/api/v1/plugins/TD_JC_SMJC_LIST',
+    '/api/v1/plugins/TD_JC_NRCJC_LIST',
+    '/api/v1/plugins/FLOW_WORK_ACCOUNT',
+    '/api/v1/plugins/TD_JC_ALL_ADD',
+    '/api/v1/plugins/TD_JC_ALL_ADD_NRC',
+    '/api/v1/plugins/EM_FILE_EVALUATE_LIST',
+    '/api/v1/plugins/EM_FILE_EVALUATE_BYID',
+    '/api/v1/plugins/EM_FILE_SEG_LIST',
+    '/api/v1/plugins/EM_APP_CONFIG_ACNO_LIST',
+    '/api/v1/plugins/EM_FILE_MH_LIST',
+    '/api/v1/plugins/EM_FILE_EVALUATE_UPDATE',
+    '/api/v1/plugins/EM_FILE_EVA_UPDATE_SBLEVEL',
+    '/api/v1/plugins/EM_FILEEVA_CONF_LIST',
+    '/api/v1/plugins/EM_FILEEVA_CONF_ADD',
+    '/api/v1/plugins/EM_FILEEVA_CONF_ACNO_ADD',
+    '/api/v1/plugins/EM_EO_CONF_ACNO_LIST_NEW',
+    '/api/v1/plugins/EM_FILE_SEG_SAVE',
+    '/api/v1/plugins/EM_FILE_SEG_UPDATE',
+    '/api/v1/plugins/EM_FILE_MH_ADD',
+    '/api/v1/plugins/EM_FILE_MH_EDIT'
+  ]);
+  const TOOLBOX_BRIDGE_ALLOWED_ORIGINS = new Set([AMES_BASE, FILE_QUICK_BASE]);
+
+  function encodeFormBody(data) {
+    const params = new URLSearchParams();
+    Object.entries(data || {}).forEach(([key, value]) => {
+      if (value === undefined || value === null) {
+        return;
+      }
+      params.append(key, String(value));
+    });
+    return params.toString();
+  }
+
+  function defaultBridgeHeaders(origin, referer) {
+    const headers = {
+      Accept: 'application/json, text/javascript, */*; q=0.01',
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+      Origin: origin,
+      'X-Requested-With': 'XMLHttpRequest'
+    };
+    if (referer) {
+      headers.Referer = referer;
+    }
+    return headers;
+  }
+
+  function installToolboxAmesBridge() {
+    if (location.hostname !== TOOLBOX_HOST) {
+      return false;
+    }
+
+    const bridgeWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+    const request = (options) => new Promise((resolve, reject) => {
+      if (typeof GM_xmlhttpRequest !== 'function') {
+        reject(new Error('Tampermonkey 跨域请求能力不可用，请更新脚本授权'));
+        return;
+      }
+
+      const url = new URL((options && options.url) || '', AMES_BASE);
+      if (!TOOLBOX_BRIDGE_ALLOWED_ORIGINS.has(url.origin) || !TOOLBOX_BRIDGE_ALLOWED_PATHS.has(url.pathname)) {
+        reject(new Error('不允许的 AMES 请求'));
+        return;
+      }
+
+      const method = String((options && options.method) || 'POST').toUpperCase();
+      GM_xmlhttpRequest({
+        method,
+        url: url.href,
+        data: method === 'GET' ? undefined : encodeFormBody(options && options.data),
+        headers: {
+          ...defaultBridgeHeaders(url.origin, options && options.referer),
+          ...((options && options.headers) || {})
+        },
+        withCredentials: true,
+        anonymous: false,
+        timeout: Math.max(5000, Number(options && options.timeout) || 30000),
+        onload(response) {
+          const text = response.responseText || '';
+          let data = text;
+          try {
+            data = text ? JSON.parse(text) : null;
+          } catch (error) {
+            // Keep text payloads for AMES endpoints that do not return JSON.
+          }
+          resolve({
+            ok: response.status >= 200 && response.status < 300,
+            status: response.status,
+            statusText: response.statusText || '',
+            data,
+            text
+          });
+        },
+        onerror() {
+          reject(new Error('AMES 请求失败'));
+        },
+        ontimeout() {
+          reject(new Error('AMES 请求超时'));
+        }
+      });
+    });
+
+    Object.defineProperty(bridgeWindow, 'AmesToolboxBridge', {
+      value: {
+        version: '1.13.5',
+        request
+      },
+      configurable: true
+    });
+    window.dispatchEvent(new CustomEvent('ames-toolbox-bridge-ready'));
+    return true;
+  }
+
+  if (installToolboxAmesBridge()) {
+    return;
+  }
 
   function cleanText(value) {
     return String(value || '').replace(/\s+/g, ' ').trim();
@@ -136,6 +278,227 @@
     const clone = container.cloneNode(true);
     clone.querySelectorAll(`.${BUTTON_WRAP_CLASS}, .${BUTTON_CLASS}`).forEach((node) => node.remove());
     return cleanText(clone.textContent);
+  }
+
+  function encodeBase64Url(value) {
+    try {
+      return btoa(unescape(encodeURIComponent(value)))
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+    } catch (error) {
+      return '';
+    }
+  }
+
+  function extractAmesLoginInfo(payload) {
+    if (Array.isArray(payload)) {
+      for (const item of payload) {
+        const result = extractAmesLoginInfo(item);
+        if (result.accountId || result.userName) {
+          return result;
+        }
+      }
+      return {};
+    }
+
+    if (!payload || typeof payload !== 'object') {
+      return {};
+    }
+
+    const loginUser = payload.loginUser || payload.LOGIN_USER || payload.user || payload.USER;
+    if (loginUser && typeof loginUser === 'object') {
+      const accountId = loginUser.accountId || loginUser.ACCOUNT_ID || loginUser.account_id || '';
+      const userName = loginUser.userName || loginUser.USER_NAME || loginUser.user_name || '';
+      if (accountId || userName) {
+        return { accountId: String(accountId || ''), userName: String(userName || '') };
+      }
+    }
+
+    const accountId = payload.accountId || payload.ACCOUNT_ID || payload.account_id || '';
+    const userName = payload.userName || payload.USER_NAME || payload.user_name || '';
+    if (accountId || userName) {
+      return { accountId: String(accountId || ''), userName: String(userName || '') };
+    }
+
+    if (payload.data) {
+      const result = extractAmesLoginInfo(payload.data);
+      if (result.accountId || result.userName) {
+        return result;
+      }
+    }
+
+    return {};
+  }
+
+  async function fetchAmesLoginInfo() {
+    try {
+      const response = await fetch('/api/v1/system/data/menu', {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+          'X-Requested-With': 'XMLHttpRequest'
+        }
+      });
+      if (!response.ok) {
+        return {};
+      }
+      return extractAmesLoginInfo(await response.json());
+    } catch (error) {
+      return {};
+    }
+  }
+
+  function buildToolboxUrl(item, targetDocument, amesLoginInfo) {
+    const url = new URL(item.path, TOOLBOX_BASE);
+
+    if (item.withAmesCookie) {
+      const cookie = targetDocument.cookie || document.cookie || '';
+      const encodedCookie = encodeBase64Url(cookie);
+      if (encodedCookie) {
+        const params = new URLSearchParams({
+          amesTool: item.cookieTool,
+          amesCookie: encodedCookie,
+          amesCookieEncoding: 'base64url',
+          amesCookieAt: String(Date.now())
+        });
+
+        if (amesLoginInfo && amesLoginInfo.accountId) {
+          params.set('amesAccountId', amesLoginInfo.accountId);
+        }
+        if (amesLoginInfo && amesLoginInfo.userName) {
+          params.set('amesUserName', amesLoginInfo.userName);
+        }
+
+        url.hash = params.toString();
+      }
+    }
+
+    return url.href;
+  }
+
+  function isTopDocument(targetDocument) {
+    try {
+      return targetDocument.defaultView && targetDocument.defaultView.top === targetDocument.defaultView;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function findAmesManualAnchor(targetDocument) {
+    const candidates = Array.from(targetDocument.querySelectorAll([
+      'a',
+      'button',
+      'li',
+      'span',
+      'div',
+      '.navbar-right > *',
+      '.nav.navbar-top-links > *'
+    ].join(',')));
+
+    return candidates.find((node) => cleanText(node.textContent) === '用户手册' && isVisibleElement(node)) || null;
+  }
+
+  function buildAmesToolbox(targetDocument) {
+    const wrap = targetDocument.createElement('span');
+    wrap.className = 'airnavx-toolbox-wrap';
+
+    const button = targetDocument.createElement('button');
+    button.type = 'button';
+    button.className = 'airnavx-toolbox-button';
+    button.textContent = '工具箱';
+    button.title = '打开马士航的工具箱';
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      wrap.classList.toggle('airnavx-toolbox-open');
+    });
+
+    const panel = targetDocument.createElement('div');
+    panel.className = 'airnavx-toolbox-panel';
+
+    TOOLBOX_ITEMS.forEach((item) => {
+      const link = targetDocument.createElement('a');
+      link.href = buildToolboxUrl(item, targetDocument);
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.dataset.tone = item.tone || 'default';
+      link.textContent = item.text;
+      link.addEventListener('click', async (event) => {
+        event.stopPropagation();
+        wrap.classList.remove('airnavx-toolbox-open');
+
+        if (!item.withAmesCookie) {
+          link.href = buildToolboxUrl(item, targetDocument);
+          return;
+        }
+
+        event.preventDefault();
+        const targetWindow = window.open('about:blank', '_blank');
+        const amesLoginInfo = await fetchAmesLoginInfo();
+        const targetUrl = buildToolboxUrl(item, targetDocument, amesLoginInfo);
+        if (targetWindow) {
+          targetWindow.opener = null;
+          targetWindow.location.href = targetUrl;
+        } else {
+          window.open(targetUrl, '_blank', 'noopener,noreferrer');
+        }
+      });
+      panel.appendChild(link);
+    });
+
+    wrap.appendChild(button);
+    wrap.appendChild(panel);
+    return wrap;
+  }
+
+  function getTopDocument(targetDocument) {
+    try {
+      return targetDocument.defaultView.top.document;
+    } catch (error) {
+      return document;
+    }
+  }
+
+  function closeAmesToolboxFrom(targetDocument, event) {
+    const topDocument = getTopDocument(targetDocument);
+    if (topDocument === targetDocument) {
+      const target = event && event.target;
+      if (target && target.closest && target.closest('.airnavx-toolbox-wrap')) {
+        return;
+      }
+    }
+
+    topDocument.querySelectorAll('.airnavx-toolbox-open').forEach((node) => {
+      node.classList.remove('airnavx-toolbox-open');
+    });
+  }
+
+  function installAmesToolboxCloseListener(targetDocument) {
+    if (!targetDocument || targetDocument.airnavxToolboxCloseInstalled) {
+      return;
+    }
+
+    targetDocument.airnavxToolboxCloseInstalled = true;
+    targetDocument.addEventListener('click', (event) => closeAmesToolboxFrom(targetDocument, event), true);
+  }
+
+  function enhanceAmesToolbox(targetDocument) {
+    if (!isTopDocument(targetDocument) || targetDocument.querySelector('.airnavx-toolbox-wrap')) {
+      return;
+    }
+
+    const manualAnchor = findAmesManualAnchor(targetDocument);
+    if (manualAnchor && manualAnchor.parentNode) {
+      manualAnchor.parentNode.insertBefore(buildAmesToolbox(targetDocument), manualAnchor);
+      return;
+    }
+
+    const nav = targetDocument.querySelector('.navbar-right, .nav.navbar-top-links.navbar-right, .navbar-top-links');
+    if (nav) {
+      nav.insertBefore(buildAmesToolbox(targetDocument), nav.firstChild);
+    }
   }
 
   function estimateTextWidth(text) {
@@ -687,6 +1050,8 @@
   function enhanceTables() {
     getCandidateDocuments().forEach((targetDocument) => {
       installStyle(targetDocument);
+      installAmesToolboxCloseListener(targetDocument);
+      enhanceAmesToolbox(targetDocument);
       enhanceTablesInDocument(targetDocument);
       enhanceEngineeringEvaluation(targetDocument);
     });
@@ -749,6 +1114,79 @@
       }
       .airnavx-eval-return:hover {
         background: #3d5d8c;
+      }
+      .airnavx-toolbox-wrap {
+        position: relative;
+        display: inline-flex;
+        align-items: center;
+        margin: 0 8px 0 4px;
+        vertical-align: middle;
+        z-index: 9999;
+      }
+      .airnavx-toolbox-button {
+        height: 28px;
+        padding: 0 12px;
+        border: 1px solid rgba(255, 255, 255, 0.5);
+        border-radius: 3px;
+        background: rgb(116, 0, 60);
+        color: #fff;
+        font-size: 13px;
+        line-height: 26px;
+        cursor: pointer;
+      }
+      .airnavx-toolbox-button:hover {
+        background: #8a0a4c;
+      }
+      .airnavx-toolbox-panel {
+        position: absolute;
+        top: 34px;
+        right: 0;
+        display: none;
+        width: 188px;
+        padding: 6px 0;
+        border: 1px solid rgba(116, 0, 60, 0.22);
+        border-top: 3px solid rgb(116, 0, 60);
+        border-radius: 4px;
+        background: #fff;
+        box-shadow: 0 8px 22px rgba(24, 39, 75, 0.18);
+      }
+      .airnavx-toolbox-open .airnavx-toolbox-panel {
+        display: block;
+      }
+      .airnavx-toolbox-panel a {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        padding: 8px 14px 8px 12px;
+        color: #24364f !important;
+        font-size: 13px;
+        line-height: 18px;
+        text-align: left;
+        text-decoration: none !important;
+        white-space: nowrap;
+      }
+      .airnavx-toolbox-panel a::before {
+        content: '';
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        border-radius: 2px;
+        background: #7b8794;
+        flex: 0 0 auto;
+      }
+      .airnavx-toolbox-panel a[data-tone="knowledge"]::before { background: #2f80ed; }
+      .airnavx-toolbox-panel a[data-tone="monitor"]::before { background: #0f9f6e; }
+      .airnavx-toolbox-panel a[data-tone="data"]::before { background: #5b6ee1; }
+      .airnavx-toolbox-panel a[data-tone="jobcard"]::before { background: rgb(116, 0, 60); }
+      .airnavx-toolbox-panel a[data-tone="xml"]::before { background: #dd7a01; }
+      .airnavx-toolbox-panel a[data-tone="manual"]::before { background: #9b2fb3; }
+      .airnavx-toolbox-panel a[data-tone="report"]::before { background: #607d8b; }
+      .airnavx-toolbox-panel a[data-tone="eval"]::before { background: #c62828; }
+      .airnavx-toolbox-panel a[data-tone="query"]::before { background: #00838f; }
+      .airnavx-toolbox-panel a[data-tone="download"]::before { background: #546e7a; }
+      .airnavx-toolbox-panel a:hover {
+        background: rgba(116, 0, 60, 0.08);
+        color: rgb(116, 0, 60) !important;
       }
     `;
     targetDocument.head.appendChild(style);
