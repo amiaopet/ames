@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.13.6
+// @version      1.13.8
 // @description  AMES 工卡/工程评估增强、AirNavX 自动处理、Boeing Toolbox 自动继续
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
@@ -33,6 +33,11 @@
   const TOOLBOX_BASE = 'https://mashihang.moonpet.cc';
   const TOOLBOX_HOST = 'mashihang.moonpet.cc';
   const REFERENCE_HEADERS = ['参考资料', '参考手册'];
+  const JOBCARD_NO_HEADER = '工卡号';
+  const JOBCARD_VERSION_HEADER = '工卡版本';
+  const SMJC_LIST_PATH = '/api/v1/plugins/TD_JC_SMJC_LIST';
+  const SMJC_REFERENCE_HEADER = '参考资料';
+  const SMJC_REFERENCE_COLUMN_WIDTH = 190;
   const MIN_REFERENCE_WIDTH = 210;
   const MAX_REFERENCE_WIDTH = 320;
   const BUTTON_WIDTH_ALLOWANCE = 78;
@@ -512,7 +517,7 @@
   }
 
   function getGridScope(bodyTable, targetDocument) {
-    const gridView = bodyTable.closest('.datagrid-view2, .datagrid-view');
+    const gridView = bodyTable.closest('.datagrid-view2, .datagrid-view1, .datagrid-view');
     return gridView || targetDocument;
   }
 
@@ -694,13 +699,269 @@
     contentNode.querySelectorAll(selector).forEach((node) => node.remove());
   }
 
+  function hasNativeReferenceHeader(bodyTable, targetDocument) {
+    const scope = getGridScope(bodyTable, targetDocument);
+    const headerRows = Array.from(scope.querySelectorAll('.datagrid-htable tr'));
+    const lastHeaderRow = headerRows[headerRows.length - 1];
+    if (!lastHeaderRow) {
+      return false;
+    }
+
+    return Array.from(lastHeaderRow.children).some((cell) => {
+      if (!REFERENCE_HEADERS.includes(cleanText(cell.textContent))) {
+        return false;
+      }
+
+      const node = cell.querySelector && cell.querySelector('.datagrid-cell');
+      const isScriptAdded = node && Array.from(node.classList).some((name) => name.includes('-airnavx-reference'));
+      return !isScriptAdded;
+    });
+  }
+
   function looksLikeJobCardGrid(bodyTable, targetDocument) {
     const headerTexts = getHeaderTexts(bodyTable, targetDocument);
-    const hasReferenceHeader = REFERENCE_HEADERS.some((headerName) => headerTexts.includes(headerName));
 
     return headerTexts.includes('工卡号') &&
       headerTexts.includes('机队') &&
-      hasReferenceHeader;
+      hasNativeReferenceHeader(bodyTable, targetDocument);
+  }
+
+  function isSmjcApprovalGrid(bodyTable, targetDocument) {
+    const headerTexts = getHeaderTexts(bodyTable, targetDocument);
+
+    return headerTexts.includes(JOBCARD_NO_HEADER) &&
+      headerTexts.includes(JOBCARD_VERSION_HEADER) &&
+      !hasNativeReferenceHeader(bodyTable, targetDocument);
+  }
+
+  function getJobCardNoColumnIndex(bodyTable, targetDocument) {
+    return getColumnIndexByHeader(bodyTable, targetDocument, JOBCARD_NO_HEADER);
+  }
+
+  function getJobCardVersionColumnIndex(bodyTable, targetDocument) {
+    return getColumnIndexByHeader(bodyTable, targetDocument, JOBCARD_VERSION_HEADER);
+  }
+
+  function normalizeJobCardNo(value) {
+    return cleanText(value).replace(/^SMJC-/i, '');
+  }
+
+  function smjcRowMatches(row, jcNo, jobcardVersion) {
+    if (!row || typeof row !== 'object') {
+      return false;
+    }
+
+    const rowJcNo = normalizeJobCardNo(row.JC_NO || row.jcNo || row.jc_no);
+    const targetJcNo = normalizeJobCardNo(jcNo);
+    if (!rowJcNo || rowJcNo !== targetJcNo) {
+      return false;
+    }
+
+    const targetVersion = cleanText(jobcardVersion);
+    if (!targetVersion) {
+      return true;
+    }
+
+    const rowVersions = [
+      row.JC_VER,
+      row.jcVer,
+      row.JOBCARD_VER,
+      row.jobcardVer
+    ].map((value) => cleanText(value));
+
+    return rowVersions.some((value) => value && value === targetVersion);
+  }
+
+  async function fetchSmjcReferenceData(jcNo, jobcardVersion) {
+    const payload = {
+      writer: '',
+      status: '',
+      fleet: '',
+      jcNo: cleanText(jcNo),
+      mark: '',
+      jcStatus: '',
+      cmpItemNo: '',
+      changeFlag: '',
+      ata: '',
+      highlight: '',
+      cepCheckout: '',
+      subjectCn: '',
+      jobcardVer: '',
+      refData: '',
+      ifOutsourcing: '',
+      page: '1',
+      rows: '100'
+    };
+
+    try {
+      const response = await fetch(SMJC_LIST_PATH, {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+          'X-Requested-With': 'XMLHttpRequest'
+        },
+        body: encodeFormBody(payload)
+      });
+      if (!response.ok) {
+        return '';
+      }
+
+      const result = await response.json();
+      const rows = Array.isArray(result && result.data) ? result.data : [];
+      const versionMatch = rows.find((row) => smjcRowMatches(row, jcNo, jobcardVersion));
+      const targetJcNo = normalizeJobCardNo(jcNo);
+      const jcNoMatch = rows.find((row) => {
+        const rowJcNo = normalizeJobCardNo(row.JC_NO || row.jcNo || row.jc_no);
+        return rowJcNo && rowJcNo === targetJcNo;
+      });
+      const match = versionMatch || jcNoMatch;
+      if (!match) {
+        return '';
+      }
+
+      return cleanText(match.REF_DATA || match.refData || match.ref_data);
+    } catch (error) {
+      return '';
+    }
+  }
+
+  function getSmjcReferenceCache(targetWindow) {
+    if (!targetWindow.__airnavxSmjcReferenceCache) {
+      targetWindow.__airnavxSmjcReferenceCache = new Map();
+    }
+    return targetWindow.__airnavxSmjcReferenceCache;
+  }
+
+  function getSmjcReferenceCellClass(columnIndex) {
+    return `datagrid-cell-c${columnIndex}-airnavx-reference`;
+  }
+
+  function installSmjcReferenceColumnStyle(targetDocument, cellClass) {
+    const styleId = `airnavx-smjc-reference-style-${cellClass}`;
+    if (targetDocument.getElementById(styleId)) {
+      return;
+    }
+
+    const style = targetDocument.createElement('style');
+    style.id = styleId;
+    style.textContent = `
+      .${cellClass} {
+        width: ${SMJC_REFERENCE_COLUMN_WIDTH}px !important;
+        min-width: ${SMJC_REFERENCE_COLUMN_WIDTH}px !important;
+      }
+    `;
+    targetDocument.head.appendChild(style);
+  }
+
+  function addSmjcReferenceColumn(bodyTable, targetDocument, jobcardVersionIndex) {
+    const scope = getGridScope(bodyTable, targetDocument);
+    const headerRows = Array.from(scope.querySelectorAll('.datagrid-htable tr'));
+    const lastHeaderRow = headerRows[headerRows.length - 1];
+    if (!lastHeaderRow) {
+      return -1;
+    }
+
+    const existingCells = Array.from(lastHeaderRow.children);
+    const existingIndex = existingCells.findIndex((cell) => {
+      const node = cell.querySelector && cell.querySelector('.datagrid-cell');
+      return node && Array.from(node.classList).some((name) => name.includes('-airnavx-reference'));
+    });
+    if (existingIndex >= 0) {
+      return existingIndex;
+    }
+
+    const columnIndex = jobcardVersionIndex + 1;
+    const cellClass = getSmjcReferenceCellClass(columnIndex);
+
+    const headerTd = targetDocument.createElement('td');
+    const headerCell = targetDocument.createElement('div');
+    headerCell.className = `datagrid-cell ${cellClass}`;
+    headerCell.textContent = SMJC_REFERENCE_HEADER;
+    headerTd.appendChild(headerCell);
+
+    const headerInsertAfter = lastHeaderRow.children[jobcardVersionIndex];
+    if (headerInsertAfter && headerInsertAfter.nextSibling) {
+      lastHeaderRow.insertBefore(headerTd, headerInsertAfter.nextSibling);
+    } else {
+      lastHeaderRow.appendChild(headerTd);
+    }
+
+    installSmjcReferenceColumnStyle(targetDocument, cellClass);
+    return columnIndex;
+  }
+
+  function ensureSmjcReferenceCell(row, targetDocument, jobcardVersionIndex, referenceColumnIndex) {
+    const existingCell = row.children[referenceColumnIndex];
+    if (existingCell) {
+      const existingNode = existingCell.querySelector && existingCell.querySelector('.datagrid-cell');
+      const isReferenceCell = existingNode && Array.from(existingNode.classList).some((name) => name.includes('-airnavx-reference'));
+      if (isReferenceCell) {
+        return existingCell;
+      }
+    }
+
+    const cellClass = getSmjcReferenceCellClass(referenceColumnIndex);
+    const td = targetDocument.createElement('td');
+    const cell = targetDocument.createElement('div');
+    cell.className = `datagrid-cell ${cellClass}`;
+    td.appendChild(cell);
+
+    const rowInsertAfter = row.children[jobcardVersionIndex];
+    if (rowInsertAfter && rowInsertAfter.nextSibling) {
+      row.insertBefore(td, rowInsertAfter.nextSibling);
+    } else {
+      row.appendChild(td);
+    }
+    return td;
+  }
+
+  async function enhanceSmjcReferenceRows(bodyTable, targetDocument, jcNoIndex, jobcardVersionIndex, referenceColumnIndex) {
+    const targetWindow = targetDocument.defaultView || window;
+    const cache = getSmjcReferenceCache(targetWindow);
+    const rows = Array.from(bodyTable.querySelectorAll('tbody tr'));
+
+    await Promise.all(rows.map(async (row) => {
+      const referenceCell = ensureSmjcReferenceCell(row, targetDocument, jobcardVersionIndex, referenceColumnIndex);
+      const jcNo = getRowCellText(row, jcNoIndex);
+      const jobcardVersion = getRowCellText(row, jobcardVersionIndex);
+      const contentNode = getCellContentNode(referenceCell);
+      if (!jcNo || !contentNode) {
+        return;
+      }
+
+      const cacheKey = `${jcNo}\u0000${jobcardVersion}`;
+      let manualNoPromise = cache.get(cacheKey);
+      if (!manualNoPromise) {
+        manualNoPromise = fetchSmjcReferenceData(jcNo, jobcardVersion);
+        cache.set(cacheKey, manualNoPromise);
+      }
+
+      const manualNo = await manualNoPromise;
+      if (!row.isConnected || !contentNode.isConnected) {
+        return;
+      }
+
+      contentNode.querySelectorAll(`.${BUTTON_WRAP_CLASS}, .${BUTTON_CLASS}`).forEach((node) => node.remove());
+      if (manualNo) {
+        contentNode.insertBefore(buildButton(manualNo, targetDocument), contentNode.firstChild);
+      }
+    }));
+  }
+
+  async function enhanceSmjcApprovalGrid(bodyTable, targetDocument) {
+    const jcNoIndex = getJobCardNoColumnIndex(bodyTable, targetDocument);
+    const jobcardVersionIndex = getJobCardVersionColumnIndex(bodyTable, targetDocument);
+    if (jcNoIndex < 0 || jobcardVersionIndex < 0) {
+      return;
+    }
+
+    const referenceColumnIndex = addSmjcReferenceColumn(bodyTable, targetDocument, jobcardVersionIndex);
+    if (referenceColumnIndex < 0) {
+      return;
+    }
+
+    await enhanceSmjcReferenceRows(bodyTable, targetDocument, jcNoIndex, jobcardVersionIndex, referenceColumnIndex);
   }
 
   function enhanceTablesInDocument(targetDocument) {
@@ -712,6 +973,9 @@
 
     targetDocument.querySelectorAll('table.datagrid-btable').forEach((bodyTable) => {
       if (!looksLikeJobCardGrid(bodyTable, targetDocument)) {
+        if (isSmjcApprovalGrid(bodyTable, targetDocument)) {
+          void enhanceSmjcApprovalGrid(bodyTable, targetDocument);
+        }
         return;
       }
 
