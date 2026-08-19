@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.14.0
+// @version      1.14.1
 // @description  AMES 工卡/工程评估增强、AirNavX 自动处理、Boeing Toolbox 自动继续
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
@@ -36,6 +36,9 @@
   const TOOLBOX_BASE = 'https://mashihang.moonpet.cc';
   const TOOLBOX_HOST = 'mashihang.moonpet.cc';
   const REFERENCE_HEADERS = ['参考资料', '参考手册'];
+  const CMP_HEADER = 'CMP号';
+  const CMP_REFERENCE_HEADER = '参考资料';
+  const CMP_REFERENCE_COLUMN_WIDTH = 92;
   const JOBCARD_NO_HEADER = '工卡号';
   const JOBCARD_VERSION_HEADER = '工卡版本';
   const SMJC_LIST_PATH = '/api/v1/plugins/TD_JC_SMJC_LIST';
@@ -563,6 +566,10 @@
     return getColumnIndexByHeader(bodyTable, targetDocument, '机队');
   }
 
+  function getCmpColumnIndex(bodyTable, targetDocument) {
+    return getColumnIndexByHeader(bodyTable, targetDocument, CMP_HEADER);
+  }
+
   function getFileNoColumnIndex(bodyTable, targetDocument) {
     return getColumnIndexByHeader(bodyTable, targetDocument, '文件编号');
   }
@@ -919,6 +926,114 @@
     return td;
   }
 
+  function getCmpReferenceCellClass(columnIndex) {
+    return `datagrid-cell-c${columnIndex}-airnavx-cmp-reference`;
+  }
+
+  function installCmpReferenceColumnStyle(targetDocument, cellClass) {
+    const styleId = `airnavx-cmp-reference-style-${cellClass}`;
+    if (targetDocument.getElementById(styleId)) {
+      return;
+    }
+
+    const style = targetDocument.createElement('style');
+    style.id = styleId;
+    style.textContent = `
+      .${cellClass} {
+        width: ${CMP_REFERENCE_COLUMN_WIDTH}px !important;
+        min-width: ${CMP_REFERENCE_COLUMN_WIDTH}px !important;
+      }
+    `;
+    targetDocument.head.appendChild(style);
+  }
+
+  function addCmpReferenceColumn(bodyTable, targetDocument, cmpColumnIndex) {
+    const scope = getGridScope(bodyTable, targetDocument);
+    const headerRows = Array.from(scope.querySelectorAll('.datagrid-htable tr'));
+    const lastHeaderRow = headerRows[headerRows.length - 1];
+    if (!lastHeaderRow) {
+      return -1;
+    }
+
+    const existingIndex = Array.from(lastHeaderRow.children).findIndex((cell) => {
+      const node = cell.querySelector && cell.querySelector('.datagrid-cell');
+      return node && Array.from(node.classList).some((name) => name.includes('-airnavx-cmp-reference'));
+    });
+    if (existingIndex >= 0) {
+      return existingIndex;
+    }
+
+    const referenceColumnIndex = cmpColumnIndex + 1;
+    const cellClass = getCmpReferenceCellClass(referenceColumnIndex);
+    const headerTd = targetDocument.createElement('td');
+    const headerCell = targetDocument.createElement('div');
+    headerCell.className = `datagrid-cell ${cellClass}`;
+    headerCell.textContent = CMP_REFERENCE_HEADER;
+    headerTd.appendChild(headerCell);
+
+    const insertAfter = lastHeaderRow.children[cmpColumnIndex];
+    if (insertAfter && insertAfter.nextSibling) {
+      lastHeaderRow.insertBefore(headerTd, insertAfter.nextSibling);
+    } else {
+      lastHeaderRow.appendChild(headerTd);
+    }
+
+    installCmpReferenceColumnStyle(targetDocument, cellClass);
+    return referenceColumnIndex;
+  }
+
+  function ensureCmpReferenceCell(row, targetDocument, cmpColumnIndex, referenceColumnIndex) {
+    const existingCell = row.children[referenceColumnIndex];
+    const existingNode = existingCell && existingCell.querySelector && existingCell.querySelector('.datagrid-cell');
+    if (existingNode && Array.from(existingNode.classList).some((name) => name.includes('-airnavx-cmp-reference'))) {
+      return existingCell;
+    }
+
+    const td = targetDocument.createElement('td');
+    const cell = targetDocument.createElement('div');
+    cell.className = `datagrid-cell ${getCmpReferenceCellClass(referenceColumnIndex)}`;
+    td.appendChild(cell);
+
+    const insertAfter = row.children[cmpColumnIndex];
+    if (insertAfter && insertAfter.nextSibling) {
+      row.insertBefore(td, insertAfter.nextSibling);
+    } else {
+      row.appendChild(td);
+    }
+    return td;
+  }
+
+  function getCmpManualSearchKeyword(cmpNo) {
+    const match = cleanText(cmpNo).match(/^A32-(.+-.+)-[^-]+$/i);
+    return match ? match[1] : '';
+  }
+
+  function enhanceCmpReferenceGrid(bodyTable, targetDocument) {
+    const cmpColumnIndex = getCmpColumnIndex(bodyTable, targetDocument);
+    if (cmpColumnIndex < 0) {
+      return;
+    }
+
+    const referenceColumnIndex = addCmpReferenceColumn(bodyTable, targetDocument, cmpColumnIndex);
+    if (referenceColumnIndex < 0) {
+      return;
+    }
+
+    bodyTable.querySelectorAll('tbody tr').forEach((row) => {
+      const referenceCell = ensureCmpReferenceCell(row, targetDocument, cmpColumnIndex, referenceColumnIndex);
+      const contentNode = getCellContentNode(referenceCell);
+      if (!contentNode) {
+        return;
+      }
+
+      const keyword = getCmpManualSearchKeyword(getRowCellText(row, cmpColumnIndex));
+      contentNode.textContent = '';
+      if (keyword) {
+        contentNode.appendChild(buildButton(keyword, targetDocument));
+      }
+    });
+  }
+
   async function enhanceSmjcReferenceRows(bodyTable, targetDocument, jcNoIndex, jobcardVersionIndex, referenceColumnIndex) {
     const targetWindow = targetDocument.defaultView || window;
     const cache = getSmjcReferenceCache(targetWindow);
@@ -975,6 +1090,8 @@
     }
 
     targetDocument.querySelectorAll('table.datagrid-btable').forEach((bodyTable) => {
+      enhanceCmpReferenceGrid(bodyTable, targetDocument);
+
       if (!looksLikeJobCardGrid(bodyTable, targetDocument)) {
         if (isSmjcApprovalGrid(bodyTable, targetDocument)) {
           void enhanceSmjcApprovalGrid(bodyTable, targetDocument);
