@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.13.8
+// @version      1.14.0
 // @description  AMES 工卡/工程评估增强、AirNavX 自动处理、Boeing Toolbox 自动继续
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
@@ -13,6 +13,9 @@
 // @downloadURL  https://raw.githubusercontent.com/amiaopet/ames/main/ames-airnavx-open-manual.user.js
 // @grant        unsafeWindow
 // @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_registerMenuCommand
 // @connect      ames.juneyaoair.com
 // @connect      10.14.122.12
 // @run-at       document-start
@@ -1565,6 +1568,8 @@
     const patchedFlag = Symbol('airnavPnPatched');
     const accessCode = '73409';
     const accessCodeSelector = 'input.access-code[name="access-code"], input[name="access-code"]';
+    const accessCodeAutoLoginKey = 'airnav-access-code-auto-login-enabled';
+    const accessCodeAutoLoginToggleId = 'airnav-access-code-auto-login-toggle';
     let hasSubmittedAccessCode = false;
 
     function formatPN(value) {
@@ -1821,6 +1826,104 @@
       return new URL(window.location.href).searchParams.has('ace');
     }
 
+    function isAccessCodeAutoLoginEnabled() {
+      try {
+        if (typeof GM_getValue === 'function') {
+          const savedValue = GM_getValue(accessCodeAutoLoginKey, null);
+          if (savedValue !== null && savedValue !== undefined) {
+            return savedValue !== false;
+          }
+
+          const legacyValue = localStorage.getItem(accessCodeAutoLoginKey);
+          if (legacyValue === '0' || legacyValue === '1') {
+            const enabled = legacyValue !== '0';
+            if (typeof GM_setValue === 'function') {
+              GM_setValue(accessCodeAutoLoginKey, enabled);
+            }
+            return enabled;
+          }
+          return true;
+        }
+
+        return localStorage.getItem(accessCodeAutoLoginKey) !== '0';
+      } catch (error) {
+        // Keep the existing automatic behavior if storage is unavailable.
+        return true;
+      }
+    }
+
+    function setAccessCodeAutoLoginEnabled(enabled) {
+      try {
+        if (typeof GM_setValue === 'function') {
+          GM_setValue(accessCodeAutoLoginKey, Boolean(enabled));
+        }
+        localStorage.setItem(accessCodeAutoLoginKey, enabled ? '1' : '0');
+      } catch (error) {
+        // The page can still use the default behavior if storage is unavailable.
+      }
+    }
+
+    function registerAccessCodeAutoLoginMenu() {
+      if (typeof GM_registerMenuCommand !== 'function') {
+        return;
+      }
+
+      const enabled = isAccessCodeAutoLoginEnabled();
+      GM_registerMenuCommand(
+        `73409 自动登录：${enabled ? '开启' : '关闭'}（点击切换）`,
+        () => {
+          setAccessCodeAutoLoginEnabled(!isAccessCodeAutoLoginEnabled());
+          window.location.reload();
+        }
+      );
+    }
+
+    function ensureAccessCodeAutoLoginToggle(input) {
+      const form = input && (input.form || document.querySelector('form[action*="set-access-code"]'));
+      if (!form) {
+        return;
+      }
+
+      let toggle = document.getElementById(accessCodeAutoLoginToggleId);
+      const updateToggle = () => {
+        const enabled = isAccessCodeAutoLoginEnabled();
+        toggle.textContent = `73409 自动登录：${enabled ? '开启' : '关闭'}`;
+        toggle.style.background = enabled ? '#1677ff' : '#6b7280';
+        toggle.setAttribute('aria-pressed', String(enabled));
+      };
+
+      if (!toggle) {
+        toggle = document.createElement('button');
+        toggle.id = accessCodeAutoLoginToggleId;
+        toggle.type = 'button';
+        toggle.style.cssText = [
+          'display:block',
+          'margin:12px auto 0',
+          'padding:7px 12px',
+          'border:0',
+          'border-radius:4px',
+          'color:#fff',
+          'font-size:13px',
+          'line-height:1.25',
+          'cursor:pointer'
+        ].join(';');
+        toggle.addEventListener('click', () => {
+          const enabled = !isAccessCodeAutoLoginEnabled();
+          setAccessCodeAutoLoginEnabled(enabled);
+          if (!enabled && input.value === accessCode) {
+            setNativeInputValue(input, '');
+          }
+          updateToggle();
+          if (enabled) {
+            fillAccessCode();
+          }
+        });
+        form.insertAdjacentElement('afterend', toggle);
+      }
+
+      updateToggle();
+    }
+
     function submitAccessCodeForm(form) {
       hasSubmittedAccessCode = true;
       try {
@@ -1844,13 +1947,18 @@
         return false;
       }
 
+      ensureAccessCodeAutoLoginToggle(input);
+      if (!isAccessCodeAutoLoginEnabled()) {
+        return true;
+      }
+
       if (input.value !== accessCode) {
         setNativeInputValue(input, accessCode);
       }
 
       if (!hasSubmittedAccessCode && !hasAccessCodeError()) {
         window.setTimeout(() => {
-          if (!hasSubmittedAccessCode && document.contains(input)) {
+          if (!hasSubmittedAccessCode && isAccessCodeAutoLoginEnabled() && document.contains(input)) {
             submitAccessCodeForm(form);
           }
         }, 300);
@@ -1878,6 +1986,7 @@
     patchHistory();
     patchNetwork();
     waitForAngular();
+    registerAccessCodeAutoLoginMenu();
     runWhenDomReady(startAccessCodeAutoFill);
   }
 
