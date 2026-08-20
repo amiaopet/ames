@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.14.1
+// @version      1.14.2
 // @description  AMES 工卡/工程评估增强、AirNavX 自动处理、Boeing Toolbox 自动继续
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
-// @match        https://mashihang.moonpet.cc/*
+// @match        http://172.29.92.15:8080/*
 // @match        https://airnavx.juneyaoair.com/airnavx*
 // @match        http://airnav.juneyaoair.com:8000/*
 // @match        http://boeingtoolbox.juneyaoair.com:8080/toolboxremote.html*
@@ -33,8 +33,8 @@
   const AMES_BASE = 'https://ames.juneyaoair.com';
   const FILE_QUICK_BASE = 'http://10.14.122.12:7080';
   const SEARCH_BASE = 'https://airnavx.juneyaoair.com/airnavx/search/text?q=';
-  const TOOLBOX_BASE = 'https://mashihang.moonpet.cc';
-  const TOOLBOX_HOST = 'mashihang.moonpet.cc';
+  const TOOLBOX_BASE = 'http://172.29.92.15:8080';
+  const TOOLBOX_HOST = '172.29.92.15:8080';
   const REFERENCE_HEADERS = ['参考资料', '参考手册'];
   const CMP_HEADER = 'CMP号';
   const CMP_REFERENCE_HEADER = '参考资料';
