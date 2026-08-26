@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.14.2
+// @version      1.14.4
 // @description  AMES 工卡/工程评估增强、AirNavX 自动处理、Boeing Toolbox 自动继续
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
@@ -17,7 +17,6 @@
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
 // @connect      ames.juneyaoair.com
-// @connect      10.14.122.12
 // @run-at       document-start
 // ==/UserScript==
 
@@ -31,7 +30,7 @@
   const EVAL_RETURN_STATE_KEY = '__airnavxEngineeringEvalReturnState';
   const EVAL_CURRENT_USER_NAME_KEY = '__airnavxEngineeringEvalCurrentUserName';
   const AMES_BASE = 'https://ames.juneyaoair.com';
-  const FILE_QUICK_BASE = 'http://10.14.122.12:7080';
+  const FILE_QUICK_BASE = AMES_BASE;
   const SEARCH_BASE = 'https://airnavx.juneyaoair.com/airnavx/search/text?q=';
   const TOOLBOX_BASE = 'http://172.29.92.15:8080';
   const TOOLBOX_HOST = '172.29.92.15:8080';
@@ -141,7 +140,7 @@
   }
 
   function installToolboxAmesBridge() {
-    if (location.hostname !== TOOLBOX_HOST) {
+    if (location.host !== TOOLBOX_HOST) {
       return false;
     }
 
@@ -197,7 +196,7 @@
 
     Object.defineProperty(bridgeWindow, 'AmesToolboxBridge', {
       value: {
-        version: '1.13.5',
+        version: '1.14.4',
         request
       },
       configurable: true
