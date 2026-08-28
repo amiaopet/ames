@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.14.4
+// @version      1.14.5
 // @description  AMES 工卡/工程评估增强、AirNavX 自动处理、Boeing Toolbox 自动继续
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
@@ -78,11 +78,8 @@
     { text: '知识检索', path: '/knowledge-base', tone: 'knowledge' },
     { text: '件序号装机监控', path: '/part-serial-monitor', tone: 'monitor' },
     { text: '飞机主数据', path: '/aircraft-master-data', tone: 'data' },
-    { text: '一键转发工卡', path: '/jobcard-forward', withAmesCookie: true, cookieTool: 'jobcard-forward', tone: 'jobcard' },
+    { text: '编卡相关', path: '/jobcard-forward', withAmesCookie: true, cookieTool: 'jobcard-tools', tone: 'jobcard' },
     { text: '工卡完工查询', path: '/jobcard-completion', tone: 'jobcard' },
-    { text: '工卡xml下载', path: '/jobcard-xml-download', tone: 'xml' },
-    { text: '手册升版', path: '/manual-revision', withAmesCookie: true, cookieTool: 'manual-revision', tone: 'manual' },
-    { text: '工卡XML翻译', path: '/jobcard-xml-translate', tone: 'xml' },
     { text: '修理报告下载', path: '/repair-report-download', tone: 'report' },
     { text: '评估文件查询', path: '/file-evaluation-search', tone: 'eval' },
     { text: '文件快速评估', path: '/file-quick-evaluation', withAmesCookie: true, cookieTool: 'file-quick-evaluation', tone: 'eval' },
