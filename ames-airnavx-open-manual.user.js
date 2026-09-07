@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.14.5
-// @description  AMES 工卡/工程评估增强、AirNavX 自动处理、Boeing Toolbox 自动继续
+// @version      1.14.8
+// @description  AMES 工卡/工程评估/报文解析增强、AirNavX 自动处理、Boeing Toolbox 自动继续
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
 // @match        http://172.29.92.15:8080/*
@@ -15,6 +15,7 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_deleteValue
 // @grant        GM_registerMenuCommand
 // @connect      ames.juneyaoair.com
 // @run-at       document-start
@@ -29,6 +30,12 @@
   const EVAL_TOOL_BUTTON_CLASS = 'airnavx-eval-tool-button';
   const EVAL_RETURN_STATE_KEY = '__airnavxEngineeringEvalReturnState';
   const EVAL_CURRENT_USER_NAME_KEY = '__airnavxEngineeringEvalCurrentUserName';
+  const RAW_MESSAGE_HEADER = '报文内容';
+  const RAW_MESSAGE_AIRCRAFT_MODEL_HEADER = '机型';
+  const RAW_MESSAGE_BUTTON_CLASS = 'xiaoma-raw-message-parse';
+  const RAW_MESSAGE_BUTTON_WRAP_CLASS = 'xiaoma-raw-message-parse-wrap';
+  const RAW_MESSAGE_IMPORT_PREFIX = 'xiaoma-raw-message-import:';
+  const RAW_MESSAGE_PARSER_URL = 'http://172.29.92.15:8080/raw-message-parser';
   const AMES_BASE = 'https://ames.juneyaoair.com';
   const FILE_QUICK_BASE = AMES_BASE;
   const SEARCH_BASE = 'https://airnavx.juneyaoair.com/airnavx/search/text?q=';
@@ -84,6 +91,7 @@
     { text: '评估文件查询', path: '/file-evaluation-search', tone: 'eval' },
     { text: '文件快速评估', path: '/file-quick-evaluation', withAmesCookie: true, cookieTool: 'file-quick-evaluation', tone: 'eval' },
     { text: '320MOD查询', path: '/a320-mod-search', tone: 'query' },
+    { text: '原始报文解析', path: '/raw-message-parser', tone: 'report' },
     { text: 'TR下载', path: '/tr-download', tone: 'download' }
   ];
   const TOOLBOX_BRIDGE_ALLOWED_PATHS = new Set([
@@ -193,7 +201,7 @@
 
     Object.defineProperty(bridgeWindow, 'AmesToolboxBridge', {
       value: {
-        version: '1.14.4',
+        version: '1.14.7',
         request
       },
       configurable: true
@@ -202,7 +210,11 @@
     return true;
   }
 
-  if (installToolboxAmesBridge()) {
+  const isRawMessageImportPage = location.host === TOOLBOX_HOST &&
+    location.pathname === '/raw-message-parser' &&
+    new URL(window.location.href).searchParams.has('rawMessageImport');
+
+  if (installToolboxAmesBridge() && !isRawMessageImportPage) {
     return;
   }
 
@@ -285,6 +297,170 @@
     const clone = container.cloneNode(true);
     clone.querySelectorAll(`.${BUTTON_WRAP_CLASS}, .${BUTTON_CLASS}`).forEach((node) => node.remove());
     return cleanText(clone.textContent);
+  }
+
+  function getRawMessageCellText(container) {
+    const clone = container.cloneNode(true);
+    clone.querySelectorAll(`.${RAW_MESSAGE_BUTTON_WRAP_CLASS}, .${RAW_MESSAGE_BUTTON_CLASS}`).forEach((node) => node.remove());
+    clone.querySelectorAll('br').forEach((node) => node.replaceWith('\n'));
+    clone.querySelectorAll('div, p, li, tr').forEach((node) => node.appendChild(clone.ownerDocument.createTextNode('\n')));
+    return String(clone.textContent || '')
+      .replace(/\u00a0/g, ' ')
+      .replace(/\r\n?/g, '\n')
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  function createRawMessageImportId() {
+    return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  }
+
+  function getRawMessageImportStorageKey(importId) {
+    return `${RAW_MESSAGE_IMPORT_PREFIX}${importId}`;
+  }
+
+  function buildRawMessageParseButton(rawMessage, targetDocument) {
+    const wrapper = targetDocument.createElement('span');
+    wrapper.className = RAW_MESSAGE_BUTTON_WRAP_CLASS;
+
+    const button = targetDocument.createElement('button');
+    button.type = 'button';
+    button.className = RAW_MESSAGE_BUTTON_CLASS;
+    button.textContent = '报文解析';
+    button.title = '带入小马原始报文解析并自动解析';
+    button.__xiaomaRawMessage = rawMessage;
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+
+      const importId = createRawMessageImportId();
+      GM_setValue(getRawMessageImportStorageKey(importId), {
+        id: importId,
+        raw: rawMessage,
+        createdAt: Date.now()
+      });
+
+      const parserUrl = new URL(RAW_MESSAGE_PARSER_URL);
+      parserUrl.searchParams.set('rawMessageImport', importId);
+      const targetWindow = targetDocument.defaultView || window;
+      targetWindow.open(parserUrl.toString(), '_blank', 'noopener,noreferrer');
+    });
+
+    wrapper.appendChild(button);
+    return wrapper;
+  }
+
+  function enhanceRawMessageGrid(bodyTable, targetDocument) {
+    const rawMessageColumnIndex = getColumnIndexByHeader(bodyTable, targetDocument, RAW_MESSAGE_HEADER);
+    const aircraftModelColumnIndex = getColumnIndexByHeader(
+      bodyTable,
+      targetDocument,
+      RAW_MESSAGE_AIRCRAFT_MODEL_HEADER
+    );
+    if (rawMessageColumnIndex < 0 || aircraftModelColumnIndex < 0) {
+      return;
+    }
+
+    bodyTable.querySelectorAll('tbody tr').forEach((row) => {
+      const contentNode = getCellContentNode(row.children[rawMessageColumnIndex]);
+      if (!contentNode) {
+        return;
+      }
+
+      const aircraftModel = getRowCellText(row, aircraftModelColumnIndex)
+        .toUpperCase()
+        .replace(/[\s-]+/g, '');
+      if (aircraftModel !== 'A320') {
+        contentNode.querySelectorAll(`.${RAW_MESSAGE_BUTTON_WRAP_CLASS}`).forEach((node) => node.remove());
+        return;
+      }
+
+      const rawMessage = getRawMessageCellText(contentNode);
+      const existingButton = contentNode.querySelector(`.${RAW_MESSAGE_BUTTON_CLASS}`);
+      if (!rawMessage) {
+        contentNode.querySelectorAll(`.${RAW_MESSAGE_BUTTON_WRAP_CLASS}`).forEach((node) => node.remove());
+        return;
+      }
+      if (existingButton && existingButton.__xiaomaRawMessage === rawMessage) {
+        return;
+      }
+
+      contentNode.querySelectorAll(`.${RAW_MESSAGE_BUTTON_WRAP_CLASS}`).forEach((node) => node.remove());
+      contentNode.insertBefore(buildRawMessageParseButton(rawMessage, targetDocument), contentNode.firstChild);
+    });
+  }
+
+  function runRawMessageParserImportRelay() {
+    const importId = new URL(window.location.href).searchParams.get('rawMessageImport');
+    if (!importId) {
+      return;
+    }
+
+    const storageKey = getRawMessageImportStorageKey(importId);
+    const pendingImport = GM_getValue(storageKey, null);
+    if (!pendingImport || pendingImport.id !== importId || typeof pendingImport.raw !== 'string') {
+      return;
+    }
+
+    let intervalId = null;
+    let fallbackTimeoutId = null;
+    let timeoutId = null;
+    const stopRelay = (removeStoredImport) => {
+      if (intervalId !== null) window.clearInterval(intervalId);
+      if (fallbackTimeoutId !== null) window.clearTimeout(fallbackTimeoutId);
+      if (timeoutId !== null) window.clearTimeout(timeoutId);
+      window.removeEventListener('message', handleAccepted);
+      if (removeStoredImport) GM_deleteValue(storageKey);
+    };
+    const handleAccepted = (event) => {
+      if (event.source !== window || event.origin !== window.location.origin) return;
+      if (event.data?.type !== 'xiaoma-raw-message-import-accepted' || event.data.importId !== importId) return;
+      stopRelay(true);
+    };
+    const sendImport = () => {
+      window.postMessage({
+        type: 'xiaoma-raw-message-import',
+        importId,
+        raw: pendingImport.raw
+      }, window.location.origin);
+    };
+    const importAndParse = () => {
+      const input = document.querySelector('.raw-input textarea, textarea[placeholder*="原始报文"]');
+      const parseButton = Array.from(document.querySelectorAll('button')).find((button) => (
+        cleanText(button.textContent) === '自动识别并解析'
+      ));
+      if (!input || !parseButton || parseButton.disabled) {
+        return false;
+      }
+
+      setNativeInputValue(input, pendingImport.raw);
+      input.focus();
+
+      const cleanedUrl = new URL(window.location.href);
+      cleanedUrl.searchParams.delete('rawMessageImport');
+      window.history.replaceState(
+        window.history.state,
+        '',
+        `${cleanedUrl.pathname}${cleanedUrl.search}${cleanedUrl.hash}`
+      );
+
+      parseButton.click();
+      stopRelay(true);
+      return true;
+    };
+
+    window.addEventListener('message', handleAccepted);
+    runWhenDomReady(() => {
+      sendImport();
+      fallbackTimeoutId = window.setTimeout(() => {
+        if (importAndParse()) return;
+        intervalId = window.setInterval(() => {
+          if (!importAndParse()) sendImport();
+        }, 300);
+      }, 500);
+      timeoutId = window.setTimeout(() => stopRelay(false), 15000);
+    });
   }
 
   function encodeBase64Url(value) {
@@ -1086,6 +1262,7 @@
     }
 
     targetDocument.querySelectorAll('table.datagrid-btable').forEach((bodyTable) => {
+      enhanceRawMessageGrid(bodyTable, targetDocument);
       enhanceCmpReferenceGrid(bodyTable, targetDocument);
 
       if (!looksLikeJobCardGrid(bodyTable, targetDocument)) {
@@ -1467,6 +1644,29 @@
       .${BUTTON_CLASS}:hover {
         background: #1f6fd1;
         border-color: #1f6fd1;
+      }
+      .${RAW_MESSAGE_BUTTON_WRAP_CLASS} {
+        display: inline-flex;
+        align-items: center;
+        margin-right: 6px;
+        vertical-align: middle;
+      }
+      .${RAW_MESSAGE_BUTTON_CLASS} {
+        display: inline-block;
+        padding: 1px 7px;
+        border: 1px solid #409eff;
+        border-radius: 3px;
+        background: #409eff;
+        color: #fff !important;
+        font: inherit;
+        font-size: 12px;
+        line-height: 18px;
+        white-space: nowrap;
+        cursor: pointer;
+      }
+      .${RAW_MESSAGE_BUTTON_CLASS}:hover {
+        background: #337ecc;
+        border-color: #337ecc;
       }
       .${EVAL_TOOL_BUTTON_CLASS} {
         display: inline-block;
@@ -2103,7 +2303,9 @@
     runWhenDomReady(startAccessCodeAutoFill);
   }
 
-  if (location.hostname === 'ames.juneyaoair.com') {
+  if (location.host === TOOLBOX_HOST && location.pathname === '/raw-message-parser') {
+    runRawMessageParserImportRelay();
+  } else if (location.hostname === 'ames.juneyaoair.com') {
     runWhenDomReady(startAmesEnhancements);
   } else if (location.hostname === 'boeingtoolbox.juneyaoair.com') {
     runBoeingToolboxAutoContinue();
