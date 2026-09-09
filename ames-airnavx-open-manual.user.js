@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.14.8
+// @version      1.14.9
 // @description  AMES 工卡/工程评估/报文解析增强、AirNavX 自动处理、Boeing Toolbox 自动继续
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
@@ -36,6 +36,13 @@
   const RAW_MESSAGE_BUTTON_WRAP_CLASS = 'xiaoma-raw-message-parse-wrap';
   const RAW_MESSAGE_IMPORT_PREFIX = 'xiaoma-raw-message-import:';
   const RAW_MESSAGE_PARSER_URL = 'http://172.29.92.15:8080/raw-message-parser';
+  const RAW_MESSAGE_GRID_ID = 'acarsDg';
+  const RAW_MESSAGE_SEARCH_FORM_ID = 'ffSearch6';
+  const RAW_MESSAGE_START_DATE_ID = 'startSynDate';
+  const RAW_MESSAGE_END_DATE_ID = 'endSynDate';
+  const RAW_MESSAGE_LIST_FUNCTION_CODE = 'MC_ACARS_ALL_LIST';
+  const RAW_MESSAGE_DATE_RANGE_KEY = '__xiaomaRawMessageDefaultDateRange';
+  const RAW_MESSAGE_GRID_PATCH_KEY = '__xiaomaRawMessageInitialQueryGuard';
   const AMES_BASE = 'https://ames.juneyaoair.com';
   const FILE_QUICK_BASE = AMES_BASE;
   const SEARCH_BASE = 'https://airnavx.juneyaoair.com/airnavx/search/text?q=';
@@ -201,7 +208,7 @@
 
     Object.defineProperty(bridgeWindow, 'AmesToolboxBridge', {
       value: {
-        version: '1.14.7',
+        version: '1.14.9',
         request
       },
       configurable: true
@@ -1824,7 +1831,125 @@
     input.dispatchEvent(new Event('change', { bubbles: true }));
   }
 
+  function formatLocalDateTime(value) {
+    const pad = (number) => String(number).padStart(2, '0');
+    return `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())} ` +
+      `${pad(value.getHours())}:${pad(value.getMinutes())}:${pad(value.getSeconds())}`;
+  }
+
+  function getRawMessageDefaultDateRange(targetWindow) {
+    if (!targetWindow[RAW_MESSAGE_DATE_RANGE_KEY]) {
+      const now = new Date();
+      const start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
+      targetWindow[RAW_MESSAGE_DATE_RANGE_KEY] = {
+        start: formatLocalDateTime(start),
+        end: formatLocalDateTime(now)
+      };
+    }
+    return targetWindow[RAW_MESSAGE_DATE_RANGE_KEY];
+  }
+
+  function getRawMessageDateFieldValue(targetDocument, fieldId) {
+    const namedValue = targetDocument.querySelector(`input.textbox-value[name="${fieldId}"]`);
+    const element = targetDocument.getElementById(fieldId);
+    return String((namedValue && namedValue.value) || (element && element.value) || '').trim();
+  }
+
+  function setRawMessageDateFieldValue(targetDocument, targetWindow, fieldId, value) {
+    const element = targetDocument.getElementById(fieldId);
+    if (!element) {
+      return false;
+    }
+
+    element.value = value;
+    element.setAttribute('value', value);
+
+    const $ = targetWindow.jQuery || targetWindow.$;
+    if ($ && $.fn && typeof $.fn.datetimebox === 'function') {
+      try {
+        $(element).datetimebox('setValue', value);
+      } catch (error) {
+        // EasyUI may not have parsed this field yet; direct values below remain available.
+      }
+    }
+
+    targetDocument.querySelectorAll(`input.textbox-value[name="${fieldId}"]`).forEach((input) => {
+      input.value = value;
+      input.setAttribute('value', value);
+    });
+
+    const visibleInput = element.nextElementSibling && element.nextElementSibling.querySelector('.textbox-text');
+    if (visibleInput) {
+      visibleInput.value = value;
+    }
+    return true;
+  }
+
+  function ensureRawMessageDefaultDateRange(targetDocument, targetWindow) {
+    const form = targetDocument.getElementById(RAW_MESSAGE_SEARCH_FORM_ID);
+    const grid = targetDocument.getElementById(RAW_MESSAGE_GRID_ID);
+    if (!form || !grid) {
+      return null;
+    }
+
+    const defaults = getRawMessageDefaultDateRange(targetWindow);
+    const start = getRawMessageDateFieldValue(targetDocument, RAW_MESSAGE_START_DATE_ID) || defaults.start;
+    const end = getRawMessageDateFieldValue(targetDocument, RAW_MESSAGE_END_DATE_ID) || defaults.end;
+    setRawMessageDateFieldValue(targetDocument, targetWindow, RAW_MESSAGE_START_DATE_ID, start);
+    setRawMessageDateFieldValue(targetDocument, targetWindow, RAW_MESSAGE_END_DATE_ID, end);
+    return { start, end };
+  }
+
+  function installRawMessageInitialQueryGuard() {
+    const targetWindow = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+    const range = ensureRawMessageDefaultDateRange(document, targetWindow);
+    const $ = targetWindow.jQuery || targetWindow.$;
+    if (!range || !$ || !$.fn || typeof $.fn.MyDataGrid !== 'function') {
+      return false;
+    }
+    if ($.fn.MyDataGrid[RAW_MESSAGE_GRID_PATCH_KEY]) {
+      return true;
+    }
+
+    const originalMyDataGrid = $.fn.MyDataGrid;
+    const guardedMyDataGrid = function guardedMyDataGrid(options, ...args) {
+      const element = this && this[0];
+      const functionCode = options && options.columns && options.columns.param &&
+        options.columns.param.FunctionCode;
+      if (element && element.id === RAW_MESSAGE_GRID_ID && functionCode === RAW_MESSAGE_LIST_FUNCTION_CODE) {
+        const currentRange = ensureRawMessageDefaultDateRange(document, targetWindow) || range;
+        const accountNumber = targetWindow.logininfo && targetWindow.logininfo.accountNumber;
+        options = {
+          ...options,
+          queryParams: {
+            ...(options.queryParams || {}),
+            startSynDate: currentRange.start,
+            endSynDate: currentRange.end,
+            nowDay: 'Y',
+            ...(accountNumber ? { empNo: accountNumber } : {})
+          }
+        };
+      }
+      return originalMyDataGrid.call(this, options, ...args);
+    };
+
+    guardedMyDataGrid[RAW_MESSAGE_GRID_PATCH_KEY] = true;
+    guardedMyDataGrid.__xiaomaOriginalMyDataGrid = originalMyDataGrid;
+    $.fn.MyDataGrid = guardedMyDataGrid;
+    return true;
+  }
+
+  function startRawMessageInitialQueryGuard() {
+    const install = () => installRawMessageInitialQueryGuard();
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', install, { once: true });
+    } else {
+      install();
+    }
+  }
+
   function startAmesEnhancements() {
+    installRawMessageInitialQueryGuard();
     enhanceTables();
 
     const scheduleEnhance = debounce(enhanceTables, 250);
@@ -2306,6 +2431,7 @@
   if (location.host === TOOLBOX_HOST && location.pathname === '/raw-message-parser') {
     runRawMessageParserImportRelay();
   } else if (location.hostname === 'ames.juneyaoair.com') {
+    startRawMessageInitialQueryGuard();
     runWhenDomReady(startAmesEnhancements);
   } else if (location.hostname === 'boeingtoolbox.juneyaoair.com') {
     runBoeingToolboxAutoContinue();
