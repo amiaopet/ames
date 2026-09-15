@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.14.9
-// @description  AMES 工卡/工程评估/报文解析增强、AirNavX 自动处理、Boeing Toolbox 自动继续
+// @version      1.15.4
+// @description  AMES 工卡/工程评估/MEL备注/报文解析增强、AirNavX 自动处理、Boeing Toolbox 自动继续
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
+// @match        https://ames.juneyaoair.com/mnt/ftp/tdms/manual/*
 // @match        http://172.29.92.15:8080/*
 // @match        https://airnavx.juneyaoair.com/airnavx*
 // @match        http://airnav.juneyaoair.com:8000/*
@@ -18,6 +19,7 @@
 // @grant        GM_deleteValue
 // @grant        GM_registerMenuCommand
 // @connect      ames.juneyaoair.com
+// @connect      172.29.92.15
 // @run-at       document-start
 // ==/UserScript==
 
@@ -36,6 +38,10 @@
   const RAW_MESSAGE_BUTTON_WRAP_CLASS = 'xiaoma-raw-message-parse-wrap';
   const RAW_MESSAGE_IMPORT_PREFIX = 'xiaoma-raw-message-import:';
   const RAW_MESSAGE_PARSER_URL = 'http://172.29.92.15:8080/raw-message-parser';
+  const RAW_MESSAGE_DETAIL_PATH = '/views/mc/technicalHandover/mc_fault_detail.shtml';
+  const RAW_MESSAGE_VIEW_DETAIL_PATH = '/views/mc/technicalHandover/mc_acars_view_detail.shtml';
+  const RAW_MESSAGE_DETAIL_FIELD_ID = 'rawMsg';
+  const RAW_MESSAGE_DETAIL_LABEL = '原始报文';
   const RAW_MESSAGE_GRID_ID = 'acarsDg';
   const RAW_MESSAGE_SEARCH_FORM_ID = 'ffSearch6';
   const RAW_MESSAGE_START_DATE_ID = 'startSynDate';
@@ -48,6 +54,8 @@
   const SEARCH_BASE = 'https://airnavx.juneyaoair.com/airnavx/search/text?q=';
   const TOOLBOX_BASE = 'http://172.29.92.15:8080';
   const TOOLBOX_HOST = '172.29.92.15:8080';
+  const MEL_REMARKS_API_BASE = `${TOOLBOX_BASE}/api/mel-remarks`;
+  const MEL_REMARK_BOX_ID = 'xiaoma-mel-remark-box';
   const REFERENCE_HEADERS = ['参考资料', '参考手册'];
   const CMP_HEADER = 'CMP号';
   const CMP_REFERENCE_HEADER = '参考资料';
@@ -99,10 +107,13 @@
     { text: '文件快速评估', path: '/file-quick-evaluation', withAmesCookie: true, cookieTool: 'file-quick-evaluation', tone: 'eval' },
     { text: '320MOD查询', path: '/a320-mod-search', tone: 'query' },
     { text: '原始报文解析', path: '/raw-message-parser', tone: 'report' },
+    { text: 'MEL备注', path: '/mel-remarks', tone: 'report' },
     { text: 'TR下载', path: '/tr-download', tone: 'download' }
   ];
   const TOOLBOX_BRIDGE_ALLOWED_PATHS = new Set([
     '/api/v1/system/data/menu',
+    '/api/v1/plugins/EM_MANUAL_LIST_TREE',
+    '/api/v1/plugins/TD_MANUAL_TREE_LIST',
     '/api/v1/plugins/TD_JC_SMJC_LIST',
     '/api/v1/plugins/TD_JC_NRCJC_LIST',
     '/api/v1/plugins/FLOW_WORK_ACCOUNT',
@@ -208,13 +219,172 @@
 
     Object.defineProperty(bridgeWindow, 'AmesToolboxBridge', {
       value: {
-        version: '1.14.9',
+        version: '1.15.2',
         request
       },
       configurable: true
     });
     window.dispatchEvent(new CustomEvent('ames-toolbox-bridge-ready'));
     return true;
+  }
+
+  function isMelManualHtmlPage() {
+    return location.hostname === 'ames.juneyaoair.com'
+      && location.pathname.startsWith('/mnt/ftp/tdms/manual/')
+      && /\/DATA\/HTML\/[^/]+\/[^/]+\.html?$/i.test(location.pathname);
+  }
+
+  function currentMelDuNumber() {
+    const filename = decodeURIComponent(location.pathname.split('/').pop() || '');
+    const value = filename.replace(/\.html?$/i, '').trim().toUpperCase();
+    return /^[A-Z0-9_-]{1,32}(?:\.[A-Z0-9_-]{1,32})+$/.test(value) ? value : '';
+  }
+
+  function toolboxRequest(options) {
+    return new Promise((resolve, reject) => {
+      if (typeof GM_xmlhttpRequest !== 'function') {
+        reject(new Error('Tampermonkey 跨域请求能力不可用'));
+        return;
+      }
+      GM_xmlhttpRequest({
+        method: options.method || 'GET',
+        url: options.url,
+        headers: options.headers || {},
+        responseType: options.responseType,
+        timeout: options.timeout || 15000,
+        onload: resolve,
+        onerror: () => reject(new Error('小工具服务请求失败')),
+        ontimeout: () => reject(new Error('小工具服务请求超时'))
+      });
+    });
+  }
+
+  async function downloadMelMt(mt) {
+    const button = document.querySelector(`#${MEL_REMARK_BOX_ID} [data-mel-mt-download]`);
+    if (button) {
+      button.disabled = true;
+      button.textContent = '正在下载MT…';
+    }
+    try {
+      const url = new URL(mt.download_url || '/api/mel-remarks/mt/download', TOOLBOX_BASE).href;
+      const response = await toolboxRequest({ method: 'GET', url, responseType: 'blob', timeout: 60000 });
+      if (response.status < 200 || response.status >= 300 || !response.response) {
+        throw new Error(`MT下载失败（HTTP ${response.status || 0}）`);
+      }
+      const objectUrl = URL.createObjectURL(response.response);
+      const link = document.createElement('a');
+      link.href = objectUrl;
+      link.download = mt.filename || 'MT文件';
+      link.style.display = 'none';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    } catch (error) {
+      window.alert(error.message || 'MT下载失败');
+    } finally {
+      if (button) {
+        button.disabled = false;
+        button.textContent = `MT：${mt.filename || '点击下载'}`;
+      }
+    }
+  }
+
+  function renderMelRemark(data) {
+    if (!data || !data.matched || !data.remark || document.getElementById(MEL_REMARK_BOX_ID)) {
+      return false;
+    }
+
+    const box = document.createElement('section');
+    box.id = MEL_REMARK_BOX_ID;
+    box.setAttribute('role', 'note');
+    box.style.cssText = [
+      'box-sizing:border-box',
+      'width:calc(100% - 24px)',
+      'margin:24px 12px 16px',
+      'padding:16px 18px',
+      'border:3px solid #d93025',
+      'border-radius:6px',
+      'background:#fff5f5',
+      'color:#7f1d1d',
+      'font-family:Arial,"Microsoft YaHei",sans-serif',
+      'font-size:15px',
+      'line-height:1.65',
+      'box-shadow:0 2px 8px rgba(217,48,37,.16)'
+    ].join(';');
+
+    const title = document.createElement('div');
+    title.textContent = '针对A320关键系统保留MEL项目运行限制要求的提示';
+    title.style.cssText = 'font-size:18px;font-weight:700;color:#b91c1c;margin-bottom:8px;';
+    box.appendChild(title);
+
+    const identity = document.createElement('div');
+    identity.textContent = [
+      data.remark.mel_item ? `MEL ${data.remark.mel_item}` : '',
+      data.remark.item_name || '',
+      `DU ${data.du_number || currentMelDuNumber()}`
+    ].filter(Boolean).join('　|　');
+    identity.style.cssText = 'font-weight:600;margin-bottom:8px;';
+    box.appendChild(identity);
+
+    const restriction = document.createElement('div');
+    restriction.textContent = data.remark.restriction;
+    restriction.style.cssText = 'white-space:pre-wrap;color:#7f1d1d;';
+    box.appendChild(restriction);
+
+    if (data.mt && data.mt.filename) {
+      const download = document.createElement('button');
+      download.type = 'button';
+      download.dataset.melMtDownload = '1';
+      download.textContent = `MT：${data.mt.filename}`;
+      download.title = '点击下载当前有效MT';
+      download.style.cssText = [
+        'display:inline-block',
+        'margin-top:12px',
+        'padding:7px 12px',
+        'border:1px solid #b91c1c',
+        'border-radius:4px',
+        'background:#fff',
+        'color:#b91c1c',
+        'font:inherit',
+        'font-weight:600',
+        'cursor:pointer'
+      ].join(';');
+      download.addEventListener('click', () => downloadMelMt(data.mt));
+      box.appendChild(download);
+    } else {
+      const missingMt = document.createElement('div');
+      missingMt.textContent = '当前未上传有效MT文件';
+      missingMt.style.cssText = 'margin-top:10px;font-size:13px;color:#991b1b;';
+      box.appendChild(missingMt);
+    }
+
+    (document.getElementById('contentContainer') || document.body).appendChild(box);
+    return true;
+  }
+
+  async function startMelRemarkInjection() {
+    const duNumber = currentMelDuNumber();
+    if (!duNumber) {
+      return;
+    }
+    try {
+      const url = new URL(`${MEL_REMARKS_API_BASE}/lookup`);
+      url.searchParams.set('du_number', duNumber);
+      url.searchParams.set('_', String(Date.now()));
+      const response = await toolboxRequest({
+        method: 'GET',
+        url: url.href,
+        headers: { Accept: 'application/json' }
+      });
+      if (response.status < 200 || response.status >= 300) {
+        throw new Error(`MEL备注查询失败（HTTP ${response.status || 0}）`);
+      }
+      const data = JSON.parse(response.responseText || 'null');
+      renderMelRemark(data);
+    } catch (error) {
+      console.warn('[MEL备注]', error.message || error);
+    }
   }
 
   const isRawMessageImportPage = location.host === TOOLBOX_HOST &&
@@ -327,7 +497,29 @@
     return `${RAW_MESSAGE_IMPORT_PREFIX}${importId}`;
   }
 
-  function buildRawMessageParseButton(rawMessage, targetDocument) {
+  function openRawMessageParser(rawMessage, targetDocument) {
+    const raw = String(rawMessage || '').trim();
+    if (!raw) {
+      const targetWindow = targetDocument.defaultView || window;
+      targetWindow.alert('当前没有可解析的原始报文');
+      return false;
+    }
+
+    const importId = createRawMessageImportId();
+    GM_setValue(getRawMessageImportStorageKey(importId), {
+      id: importId,
+      raw,
+      createdAt: Date.now()
+    });
+
+    const parserUrl = new URL(RAW_MESSAGE_PARSER_URL);
+    parserUrl.searchParams.set('rawMessageImport', importId);
+    const targetWindow = targetDocument.defaultView || window;
+    targetWindow.open(parserUrl.toString(), '_blank', 'noopener,noreferrer');
+    return true;
+  }
+
+  function buildRawMessageParseButton(rawMessage, targetDocument, getCurrentRawMessage) {
     const wrapper = targetDocument.createElement('span');
     wrapper.className = RAW_MESSAGE_BUTTON_WRAP_CLASS;
 
@@ -340,18 +532,10 @@
     button.addEventListener('click', (event) => {
       event.preventDefault();
       event.stopPropagation();
-
-      const importId = createRawMessageImportId();
-      GM_setValue(getRawMessageImportStorageKey(importId), {
-        id: importId,
-        raw: rawMessage,
-        createdAt: Date.now()
-      });
-
-      const parserUrl = new URL(RAW_MESSAGE_PARSER_URL);
-      parserUrl.searchParams.set('rawMessageImport', importId);
-      const targetWindow = targetDocument.defaultView || window;
-      targetWindow.open(parserUrl.toString(), '_blank', 'noopener,noreferrer');
+      const messageToParse = typeof getCurrentRawMessage === 'function'
+        ? getCurrentRawMessage()
+        : rawMessage;
+      openRawMessageParser(messageToParse, targetDocument);
     });
 
     wrapper.appendChild(button);
@@ -396,6 +580,128 @@
       contentNode.querySelectorAll(`.${RAW_MESSAGE_BUTTON_WRAP_CLASS}`).forEach((node) => node.remove());
       contentNode.insertBefore(buildRawMessageParseButton(rawMessage, targetDocument), contentNode.firstChild);
     });
+  }
+
+  function isRawMessageDetailDocument(targetDocument) {
+    try {
+      return targetDocument.defaultView &&
+        targetDocument.defaultView.location.pathname === RAW_MESSAGE_DETAIL_PATH;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function getRawMessageDetailText(targetDocument) {
+    const field = targetDocument.getElementById(RAW_MESSAGE_DETAIL_FIELD_ID);
+    if (!field) {
+      return '';
+    }
+
+    const targetWindow = targetDocument.defaultView || window;
+    const $ = targetWindow.jQuery || targetWindow.$;
+    if ($ && $.fn && typeof $.fn.textbox === 'function') {
+      try {
+        const value = $(field).textbox('getValue');
+        if (value) {
+          return String(value).trim();
+        }
+      } catch (error) {
+        // Fall back to the native textarea value.
+      }
+    }
+    return String(field.value || '').trim();
+  }
+
+  function enhanceRawMessageDetail(targetDocument) {
+    if (!isRawMessageDetailDocument(targetDocument)) {
+      return;
+    }
+
+    const field = targetDocument.getElementById(RAW_MESSAGE_DETAIL_FIELD_ID);
+    const container = field && field.parentElement;
+    if (!field || !container) {
+      return;
+    }
+
+    const label = Array.from(container.querySelectorAll('span')).find((node) => (
+      cleanText(node.textContent) === RAW_MESSAGE_DETAIL_LABEL
+    ));
+    if (!label) {
+      return;
+    }
+
+    const rawMessage = getRawMessageDetailText(targetDocument);
+    const existingButton = container.querySelector(
+      `.${RAW_MESSAGE_BUTTON_CLASS}[data-xiaoma-raw-message-detail="1"]`
+    );
+    if (existingButton && existingButton.__xiaomaRawMessage === rawMessage) {
+      return;
+    }
+
+    container.querySelectorAll('[data-xiaoma-raw-message-detail-wrap="1"]').forEach((node) => node.remove());
+    const wrapper = buildRawMessageParseButton(
+      rawMessage,
+      targetDocument,
+      () => getRawMessageDetailText(targetDocument)
+    );
+    wrapper.dataset.xiaomaRawMessageDetailWrap = '1';
+    wrapper.classList.add('xiaoma-raw-message-detail-parse-wrap');
+    const button = wrapper.querySelector(`.${RAW_MESSAGE_BUTTON_CLASS}`);
+    if (button) {
+      button.dataset.xiaomaRawMessageDetail = '1';
+      button.disabled = !rawMessage;
+      if (!rawMessage) {
+        button.title = '等待原始报文加载后即可解析';
+      }
+    }
+    label.insertAdjacentElement('afterend', wrapper);
+  }
+
+  function isRawMessageViewDetailDocument(targetDocument) {
+    try {
+      return targetDocument.defaultView &&
+        targetDocument.defaultView.location.pathname === RAW_MESSAGE_VIEW_DETAIL_PATH;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function enhanceRawMessageViewDetail(targetDocument) {
+    if (!isRawMessageViewDetailDocument(targetDocument)) {
+      return;
+    }
+
+    const field = targetDocument.getElementById(RAW_MESSAGE_DETAIL_FIELD_ID);
+    const container = field && field.parentElement;
+    if (!field || !container) {
+      return;
+    }
+
+    const rawMessage = getRawMessageDetailText(targetDocument);
+    const existingButton = container.querySelector(
+      `.${RAW_MESSAGE_BUTTON_CLASS}[data-xiaoma-raw-message-view-detail="1"]`
+    );
+    if (existingButton && existingButton.__xiaomaRawMessage === rawMessage) {
+      return;
+    }
+
+    container.querySelectorAll('[data-xiaoma-raw-message-view-detail-wrap="1"]').forEach((node) => node.remove());
+    const wrapper = buildRawMessageParseButton(
+      rawMessage,
+      targetDocument,
+      () => getRawMessageDetailText(targetDocument)
+    );
+    wrapper.dataset.xiaomaRawMessageViewDetailWrap = '1';
+    wrapper.classList.add('xiaoma-raw-message-view-detail-parse-wrap');
+    const button = wrapper.querySelector(`.${RAW_MESSAGE_BUTTON_CLASS}`);
+    if (button) {
+      button.dataset.xiaomaRawMessageViewDetail = '1';
+      button.disabled = !rawMessage;
+      if (!rawMessage) {
+        button.title = '等待原始报文加载后即可解析';
+      }
+    }
+    container.insertBefore(wrapper, container.firstChild);
   }
 
   function runRawMessageParserImportRelay() {
@@ -1617,6 +1923,8 @@
       installAmesToolboxCloseListener(targetDocument);
       enhanceAmesToolbox(targetDocument);
       enhanceTablesInDocument(targetDocument);
+      enhanceRawMessageDetail(targetDocument);
+      enhanceRawMessageViewDetail(targetDocument);
       enhanceEngineeringEvaluation(targetDocument);
     });
   }
@@ -1657,6 +1965,15 @@
         align-items: center;
         margin-right: 6px;
         vertical-align: middle;
+      }
+      .xiaoma-raw-message-detail-parse-wrap {
+        margin-left: 8px;
+        margin-right: 0;
+      }
+      .xiaoma-raw-message-view-detail-parse-wrap {
+        display: flex;
+        justify-content: flex-end;
+        margin: 0 0 6px;
       }
       .${RAW_MESSAGE_BUTTON_CLASS} {
         display: inline-block;
@@ -2431,8 +2748,12 @@
   if (location.host === TOOLBOX_HOST && location.pathname === '/raw-message-parser') {
     runRawMessageParserImportRelay();
   } else if (location.hostname === 'ames.juneyaoair.com') {
-    startRawMessageInitialQueryGuard();
-    runWhenDomReady(startAmesEnhancements);
+    if (isMelManualHtmlPage()) {
+      runWhenDomReady(startMelRemarkInjection);
+    } else {
+      startRawMessageInitialQueryGuard();
+      runWhenDomReady(startAmesEnhancements);
+    }
   } else if (location.hostname === 'boeingtoolbox.juneyaoair.com') {
     runBoeingToolboxAutoContinue();
   } else if (location.hostname === 'airnavx.juneyaoair.com' || location.host === 'airnav.juneyaoair.com:8000') {
