@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.15.4
+// @version      1.15.5
 // @description  AMES 工卡/工程评估/MEL备注/报文解析增强、AirNavX 自动处理、Boeing Toolbox 自动继续
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
@@ -103,8 +103,6 @@
     { text: '编卡相关', path: '/jobcard-forward', withAmesCookie: true, cookieTool: 'jobcard-tools', tone: 'jobcard' },
     { text: '工卡完工查询', path: '/jobcard-completion', tone: 'jobcard' },
     { text: '修理报告下载', path: '/repair-report-download', tone: 'report' },
-    { text: '评估文件查询', path: '/file-evaluation-search', tone: 'eval' },
-    { text: '文件快速评估', path: '/file-quick-evaluation', withAmesCookie: true, cookieTool: 'file-quick-evaluation', tone: 'eval' },
     { text: '320MOD查询', path: '/a320-mod-search', tone: 'query' },
     { text: '原始报文解析', path: '/raw-message-parser', tone: 'report' },
     { text: 'MEL备注', path: '/mel-remarks', tone: 'report' },
