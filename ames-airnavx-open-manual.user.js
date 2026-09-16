@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.15.5
+// @version      1.15.6
 // @description  AMES 工卡/工程评估/MEL备注/报文解析增强、AirNavX 自动处理、Boeing Toolbox 自动继续
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
@@ -34,6 +34,7 @@
   const EVAL_CURRENT_USER_NAME_KEY = '__airnavxEngineeringEvalCurrentUserName';
   const RAW_MESSAGE_HEADER = '报文内容';
   const RAW_MESSAGE_AIRCRAFT_MODEL_HEADER = '机型';
+  const RAW_MESSAGE_TYPE_HEADER = '类型';
   const RAW_MESSAGE_BUTTON_CLASS = 'xiaoma-raw-message-parse';
   const RAW_MESSAGE_BUTTON_WRAP_CLASS = 'xiaoma-raw-message-parse-wrap';
   const RAW_MESSAGE_IMPORT_PREFIX = 'xiaoma-raw-message-import:';
@@ -547,7 +548,12 @@
       targetDocument,
       RAW_MESSAGE_AIRCRAFT_MODEL_HEADER
     );
-    if (rawMessageColumnIndex < 0 || aircraftModelColumnIndex < 0) {
+    const messageTypeColumnIndex = getColumnIndexByHeader(
+      bodyTable,
+      targetDocument,
+      RAW_MESSAGE_TYPE_HEADER
+    );
+    if (rawMessageColumnIndex < 0 || aircraftModelColumnIndex < 0 || messageTypeColumnIndex < 0) {
       return;
     }
 
@@ -560,7 +566,10 @@
       const aircraftModel = getRowCellText(row, aircraftModelColumnIndex)
         .toUpperCase()
         .replace(/[\s-]+/g, '');
-      if (aircraftModel !== 'A320') {
+      const messageType = getRowCellText(row, messageTypeColumnIndex).toUpperCase().trim();
+      const isA320 = aircraftModel === 'A320';
+      const isB787Dfd = aircraftModel.startsWith('B787') && messageType === 'DFD';
+      if (!isA320 && !isB787Dfd) {
         contentNode.querySelectorAll(`.${RAW_MESSAGE_BUTTON_WRAP_CLASS}`).forEach((node) => node.remove());
         return;
       }
