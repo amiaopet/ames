@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.15.6
+// @version      1.15.8
 // @description  AMES 工卡/工程评估/MEL备注/报文解析增强、AirNavX 自动处理、Boeing Toolbox 自动继续
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
@@ -51,7 +51,6 @@
   const RAW_MESSAGE_DATE_RANGE_KEY = '__xiaomaRawMessageDefaultDateRange';
   const RAW_MESSAGE_GRID_PATCH_KEY = '__xiaomaRawMessageInitialQueryGuard';
   const AMES_BASE = 'https://ames.juneyaoair.com';
-  const FILE_QUICK_BASE = AMES_BASE;
   const SEARCH_BASE = 'https://airnavx.juneyaoair.com/airnavx/search/text?q=';
   const TOOLBOX_BASE = 'http://172.29.92.15:8080';
   const TOOLBOX_HOST = '172.29.92.15:8080';
@@ -117,24 +116,9 @@
     '/api/v1/plugins/TD_JC_NRCJC_LIST',
     '/api/v1/plugins/FLOW_WORK_ACCOUNT',
     '/api/v1/plugins/TD_JC_ALL_ADD',
-    '/api/v1/plugins/TD_JC_ALL_ADD_NRC',
-    '/api/v1/plugins/EM_FILE_EVALUATE_LIST',
-    '/api/v1/plugins/EM_FILE_EVALUATE_BYID',
-    '/api/v1/plugins/EM_FILE_SEG_LIST',
-    '/api/v1/plugins/EM_APP_CONFIG_ACNO_LIST',
-    '/api/v1/plugins/EM_FILE_MH_LIST',
-    '/api/v1/plugins/EM_FILE_EVALUATE_UPDATE',
-    '/api/v1/plugins/EM_FILE_EVA_UPDATE_SBLEVEL',
-    '/api/v1/plugins/EM_FILEEVA_CONF_LIST',
-    '/api/v1/plugins/EM_FILEEVA_CONF_ADD',
-    '/api/v1/plugins/EM_FILEEVA_CONF_ACNO_ADD',
-    '/api/v1/plugins/EM_EO_CONF_ACNO_LIST_NEW',
-    '/api/v1/plugins/EM_FILE_SEG_SAVE',
-    '/api/v1/plugins/EM_FILE_SEG_UPDATE',
-    '/api/v1/plugins/EM_FILE_MH_ADD',
-    '/api/v1/plugins/EM_FILE_MH_EDIT'
+    '/api/v1/plugins/TD_JC_ALL_ADD_NRC'
   ]);
-  const TOOLBOX_BRIDGE_ALLOWED_ORIGINS = new Set([AMES_BASE, FILE_QUICK_BASE]);
+  const TOOLBOX_BRIDGE_ALLOWED_ORIGINS = new Set([AMES_BASE]);
 
   function encodeFormBody(data) {
     const params = new URLSearchParams();
@@ -227,16 +211,30 @@
     return true;
   }
 
-  function isMelManualHtmlPage() {
-    return location.hostname === 'ames.juneyaoair.com'
-      && location.pathname.startsWith('/mnt/ftp/tdms/manual/')
-      && /\/DATA\/HTML\/[^/]+\/[^/]+\.html?$/i.test(location.pathname);
+  function currentMelPageContext() {
+    if (location.hostname !== 'ames.juneyaoair.com') {
+      return null;
+    }
+    const pathname = decodeURIComponent(location.pathname || '');
+    if (/\/A320\/MEL_ZH\//i.test(pathname) && /\/DATA\/HTML\/[^/]+\/[^/]+\.html?$/i.test(pathname)) {
+      const filename = pathname.split('/').pop() || '';
+      const duNumber = filename.replace(/\.html?$/i, '').trim().toUpperCase();
+      if (/^[A-Z0-9_-]{1,32}(?:\.[A-Z0-9_-]{1,32})+$/.test(duNumber)) {
+        return { aircraftModel: 'A320', matchValue: duNumber, queryName: 'du_number' };
+      }
+    }
+    if (/\/B787\/MEL_ZH\//i.test(pathname) && /\/XML\/[^/]+\.xml$/i.test(pathname)) {
+      const filename = pathname.split('/').pop() || '';
+      const match = filename.replace(/\.xml$/i, '').match(/(\d{2}-\d{2}-\d{2})$/);
+      if (match) {
+        return { aircraftModel: 'B787', matchValue: match[1], queryName: 'mel_item' };
+      }
+    }
+    return null;
   }
 
-  function currentMelDuNumber() {
-    const filename = decodeURIComponent(location.pathname.split('/').pop() || '');
-    const value = filename.replace(/\.html?$/i, '').trim().toUpperCase();
-    return /^[A-Z0-9_-]{1,32}(?:\.[A-Z0-9_-]{1,32})+$/.test(value) ? value : '';
+  function isMelManualPage() {
+    return Boolean(currentMelPageContext());
   }
 
   function toolboxRequest(options) {
@@ -258,35 +256,56 @@
     });
   }
 
-  async function downloadMelMt(mt) {
-    const button = document.querySelector(`#${MEL_REMARK_BOX_ID} [data-mel-mt-download]`);
+  async function downloadMelFile(file, button, labelPrefix) {
     if (button) {
       button.disabled = true;
-      button.textContent = '正在下载MT…';
+      button.textContent = '正在下载…';
     }
     try {
-      const url = new URL(mt.download_url || '/api/mel-remarks/mt/download', TOOLBOX_BASE).href;
+      const url = new URL(file.download_url, TOOLBOX_BASE).href;
       const response = await toolboxRequest({ method: 'GET', url, responseType: 'blob', timeout: 60000 });
       if (response.status < 200 || response.status >= 300 || !response.response) {
-        throw new Error(`MT下载失败（HTTP ${response.status || 0}）`);
+        throw new Error(`文件下载失败（HTTP ${response.status || 0}）`);
       }
       const objectUrl = URL.createObjectURL(response.response);
       const link = document.createElement('a');
       link.href = objectUrl;
-      link.download = mt.filename || 'MT文件';
+      link.download = file.filename || 'MEL相关文件';
       link.style.display = 'none';
       document.body.appendChild(link);
       link.click();
       link.remove();
       window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
     } catch (error) {
-      window.alert(error.message || 'MT下载失败');
+      window.alert(error.message || '文件下载失败');
     } finally {
       if (button) {
         button.disabled = false;
-        button.textContent = `MT：${mt.filename || '点击下载'}`;
+        button.textContent = `${labelPrefix}：${file.filename || '点击下载'}`;
       }
     }
+  }
+
+  function createMelDownloadButton(file, labelPrefix, dataAttribute) {
+    const download = document.createElement('button');
+    download.type = 'button';
+    download.dataset[dataAttribute] = '1';
+    download.textContent = `${labelPrefix}：${file.filename}`;
+    download.title = `点击下载${labelPrefix}`;
+    download.style.cssText = [
+      'display:inline-block',
+      'margin:10px 8px 0 0',
+      'padding:7px 12px',
+      'border:1px solid #b91c1c',
+      'border-radius:4px',
+      'background:#fff',
+      'color:#b91c1c',
+      'font:inherit',
+      'font-weight:600',
+      'cursor:pointer'
+    ].join(';');
+    download.addEventListener('click', () => downloadMelFile(file, download, labelPrefix));
+    return download;
   }
 
   function renderMelRemark(data) {
@@ -313,7 +332,8 @@
     ].join(';');
 
     const title = document.createElement('div');
-    title.textContent = '针对A320关键系统保留MEL项目运行限制要求的提示';
+    const aircraftModel = data.aircraft_model || data.remark.aircraft_model || 'A320';
+    title.textContent = `针对${aircraftModel}关键系统保留MEL项目运行限制要求的提示`;
     title.style.cssText = 'font-size:18px;font-weight:700;color:#b91c1c;margin-bottom:8px;';
     box.appendChild(title);
 
@@ -321,7 +341,10 @@
     identity.textContent = [
       data.remark.mel_item ? `MEL ${data.remark.mel_item}` : '',
       data.remark.item_name || '',
-      `DU ${data.du_number || currentMelDuNumber()}`
+      data.remark.item_title || '',
+      aircraftModel === 'A320'
+        ? `DU ${data.du_number || data.match_value || ''}`
+        : `XML项目号 ${data.mel_item || data.match_value || ''}`
     ].filter(Boolean).join('　|　');
     identity.style.cssText = 'font-weight:600;margin-bottom:8px;';
     box.appendChild(identity);
@@ -332,44 +355,40 @@
     box.appendChild(restriction);
 
     if (data.mt && data.mt.filename) {
-      const download = document.createElement('button');
-      download.type = 'button';
-      download.dataset.melMtDownload = '1';
-      download.textContent = `MT：${data.mt.filename}`;
-      download.title = '点击下载当前有效MT';
-      download.style.cssText = [
-        'display:inline-block',
-        'margin-top:12px',
-        'padding:7px 12px',
-        'border:1px solid #b91c1c',
-        'border-radius:4px',
-        'background:#fff',
-        'color:#b91c1c',
-        'font:inherit',
-        'font-weight:600',
-        'cursor:pointer'
-      ].join(';');
-      download.addEventListener('click', () => downloadMelMt(data.mt));
-      box.appendChild(download);
+      box.appendChild(createMelDownloadButton(data.mt, `${aircraftModel}通用MT`, 'melMtDownload'));
     } else {
       const missingMt = document.createElement('div');
-      missingMt.textContent = '当前未上传有效MT文件';
+      missingMt.textContent = `${aircraftModel}当前未上传通用MT文件`;
       missingMt.style.cssText = 'margin-top:10px;font-size:13px;color:#991b1b;';
       box.appendChild(missingMt);
     }
 
-    (document.getElementById('contentContainer') || document.body).appendChild(box);
+    const relatedFiles = Array.isArray(data.remark.related_files) ? data.remark.related_files : [];
+    if (relatedFiles.length) {
+      const relatedHeading = document.createElement('div');
+      relatedHeading.textContent = '本条目相关文件：';
+      relatedHeading.style.cssText = 'margin-top:12px;font-weight:600;';
+      box.appendChild(relatedHeading);
+      relatedFiles.forEach(file => {
+        if (file && file.filename && file.download_url) {
+          box.appendChild(createMelDownloadButton(file, '相关文件', 'melRelatedDownload'));
+        }
+      });
+    }
+
+    (document.getElementById('contentContainer') || document.body || document.documentElement).appendChild(box);
     return true;
   }
 
   async function startMelRemarkInjection() {
-    const duNumber = currentMelDuNumber();
-    if (!duNumber) {
+    const context = currentMelPageContext();
+    if (!context) {
       return;
     }
     try {
       const url = new URL(`${MEL_REMARKS_API_BASE}/lookup`);
-      url.searchParams.set('du_number', duNumber);
+      url.searchParams.set('aircraft_model', context.aircraftModel);
+      url.searchParams.set(context.queryName, context.matchValue);
       url.searchParams.set('_', String(Date.now()));
       const response = await toolboxRequest({
         method: 'GET',
@@ -2755,7 +2774,7 @@
   if (location.host === TOOLBOX_HOST && location.pathname === '/raw-message-parser') {
     runRawMessageParserImportRelay();
   } else if (location.hostname === 'ames.juneyaoair.com') {
-    if (isMelManualHtmlPage()) {
+    if (isMelManualPage()) {
       runWhenDomReady(startMelRemarkInjection);
     } else {
       startRawMessageInitialQueryGuard();
