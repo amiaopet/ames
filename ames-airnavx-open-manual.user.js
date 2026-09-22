@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.15.8
+// @version      1.15.9
 // @description  AMES 工卡/工程评估/MEL备注/报文解析增强、AirNavX 自动处理、Boeing Toolbox 自动继续
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
@@ -223,11 +223,10 @@
         return { aircraftModel: 'A320', matchValue: duNumber, queryName: 'du_number' };
       }
     }
-    if (/\/B787\/MEL_ZH\//i.test(pathname) && /\/XML\/[^/]+\.xml$/i.test(pathname)) {
-      const filename = pathname.split('/').pop() || '';
-      const match = filename.replace(/\.xml$/i, '').match(/(\d{2}-\d{2}-\d{2})$/);
-      if (match) {
-        return { aircraftModel: 'B787', matchValue: match[1], queryName: 'mel_item' };
+    if (/\/B787\/MEL_ZH\//i.test(pathname) && /\.xml$/i.test(pathname)) {
+      const matches = pathname.match(/\d{2}-\d{2}-\d{2}/g);
+      if (matches?.length) {
+        return { aircraftModel: 'B787', matchValue: matches[matches.length - 1], queryName: 'mel_item' };
       }
     }
     return null;
@@ -344,7 +343,7 @@
       data.remark.item_title || '',
       aircraftModel === 'A320'
         ? `DU ${data.du_number || data.match_value || ''}`
-        : `XML项目号 ${data.mel_item || data.match_value || ''}`
+        : `MEL项目号 ${data.mel_item || data.match_value || ''}`
     ].filter(Boolean).join('　|　');
     identity.style.cssText = 'font-weight:600;margin-bottom:8px;';
     box.appendChild(identity);
