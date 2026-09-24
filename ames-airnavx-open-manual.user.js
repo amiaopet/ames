@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.16.2
+// @version      1.16.5
 // @description  AMES 工卡/工程评估/MEL备注/报文解析增强、AirNavX 自动处理与手册翻译、Boeing Toolbox 自动继续
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
@@ -2770,6 +2770,8 @@
       let annotations = new Set();
       let notesByNode = new Map();
       let translatorPromise = null;
+      let translatorCreation = null;
+      let translatorInstance = null;
       let observedViewer = null;
       let observer = null;
       let runId = 0;
@@ -2787,9 +2789,35 @@
         }
       }
 
+      function setTranslatorCreateError(error) {
+        const name = String(error && error.name || '').trim();
+        const detail = String(error && error.message || error || '未知错误');
+        const label = name && name !== 'Error' ? `Chrome 拒绝：${name}` : '本机翻译未就绪，点击重试';
+        setStatus(label, `${name && name !== 'Error' ? `${name}: ` : ''}${detail}`);
+      }
+
+      function destroyTranslator(translator) {
+        try {
+          if (translator && typeof translator.destroy === 'function') {
+            translator.destroy();
+          }
+        } catch (_error) {
+          // A failed cleanup must not prevent restoring the English text.
+        }
+      }
+
+      function releaseTranslator() {
+        translatorCreation = null;
+        translatorPromise = null;
+        const translator = translatorInstance;
+        translatorInstance = null;
+        destroyTranslator(translator);
+      }
+
       function restoreOriginal() {
         runId += 1;
         translationActive = false;
+        releaseTranslator();
         rescanNeeded = false;
         if (rescanTimer) {
           window.clearTimeout(rescanTimer);
@@ -2839,8 +2867,13 @@
           return;
         }
         translationRunning = true;
+        let translatorReady = false;
         try {
           const translator = await translatorPromise;
+          translatorReady = true;
+          if (currentRun === runId && translationActive) {
+            setStatus('语言包就绪 · 开始翻译');
+          }
           let finished = 0;
           do {
             rescanNeeded = false;
@@ -2902,7 +2935,14 @@
         } catch (error) {
           if (currentRun === runId) {
             restoreOriginal();
-            setStatus('翻译失败，已恢复原文', String(error && error.message || error));
+            const detail = String(error && error.message || error);
+            const message = translatorReady ? '翻译失败，已恢复原文' :
+              error && error.code === 'AIRNAV_TRANSLATOR_TIMEOUT' ? '语言包超时，点击重试' : null;
+            if (message) {
+              setStatus(message, detail);
+            } else {
+              setTranslatorCreateError(error);
+            }
           }
         } finally {
           translationRunning = false;
@@ -2952,20 +2992,53 @@
 
         // create() starts in the click handler so Chrome can download a language pack when needed.
         if (!translatorPromise) {
-          translatorPromise = TranslatorApi.create({
-            sourceLanguage: 'en',
-            targetLanguage: 'zh',
-            monitor(monitor) {
-              monitor.addEventListener('downloadprogress', (event) => {
-                if (currentRun === runId) {
-                  setStatus(`下载中文语言包 ${Math.round(event.loaded * 100)}%`);
-                }
-              });
-            }
-          }).catch((error) => {
-            translatorPromise = null;
-            throw error;
-          });
+          try {
+            let downloadPercent = null;
+            const creation = Promise.resolve(TranslatorApi.create({
+              sourceLanguage: 'en',
+              targetLanguage: 'zh',
+              monitor(monitor) {
+                monitor.addEventListener('downloadprogress', (event) => {
+                  downloadPercent = Math.round(event.loaded * 100);
+                  if (currentRun === runId) {
+                    setStatus(`下载中文语言包 ${downloadPercent}%`);
+                  }
+                });
+              }
+            }));
+            translatorCreation = creation;
+            creation.then((translator) => {
+              if (translatorCreation === creation) {
+                translatorInstance = translator;
+              } else {
+                destroyTranslator(translator);
+              }
+            }, () => {});
+            const hintTimer = window.setTimeout(() => {
+              if (currentRun === runId && translationActive) {
+                setStatus(downloadPercent === null ? '等待 Chrome 加载语言包' : `语言包下载中 ${downloadPercent}%`,
+                  '首次使用需下载；如长时间无进度，请检查 Chrome 的语言包下载状态');
+              }
+            }, 10000);
+            let timeoutTimer;
+            const timeout = new Promise((_, reject) => {
+              timeoutTimer = window.setTimeout(() => {
+                const error = new Error('Chrome 翻译语言包 2 分钟内未就绪。请检查网络与 chrome://on-device-translation-internals/ 中的语言包状态，然后重试。');
+                error.code = 'AIRNAV_TRANSLATOR_TIMEOUT';
+                reject(error);
+              }, 120000);
+            });
+            translatorPromise = Promise.race([creation, timeout]).finally(() => {
+              window.clearTimeout(hintTimer);
+              window.clearTimeout(timeoutTimer);
+            });
+          } catch (error) {
+            restoreOriginal();
+            setTranslatorCreateError(error);
+            return;
+          }
+        } else {
+          setStatus('等待 Chrome 本机翻译');
         }
         translatePending(viewer, currentRun);
       }
@@ -3062,6 +3135,7 @@
 
       ensureButton();
       window.setInterval(ensureButton, 1000);
+      window.addEventListener('pagehide', restoreOriginal);
     }
 
     patchDomEvents();
