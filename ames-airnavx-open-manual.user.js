@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.15.9
-// @description  AMES 工卡/工程评估/MEL备注/报文解析增强、AirNavX 自动处理、Boeing Toolbox 自动继续
+// @version      1.16.2
+// @description  AMES 工卡/工程评估/MEL备注/报文解析增强、AirNavX 自动处理与手册翻译、Boeing Toolbox 自动继续
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
 // @match        https://ames.juneyaoair.com/mnt/ftp/tdms/manual/*
@@ -2762,12 +2762,315 @@
       window.setTimeout(() => observer.disconnect(), 15000);
     }
 
+    function startDocumentTranslation() {
+      const buttonId = 'airnavx-translate-document';
+      const statusId = 'airnavx-translate-status';
+      const cache = new Map();
+      let originals = new Map();
+      let annotations = new Set();
+      let notesByNode = new Map();
+      let translatorPromise = null;
+      let observedViewer = null;
+      let observer = null;
+      let runId = 0;
+      let translationActive = false;
+      let translationRunning = false;
+      let rescanNeeded = false;
+      let rescanTimer = null;
+
+      function setStatus(message, error) {
+        const status = document.getElementById(statusId);
+        if (status) {
+          status.textContent = message;
+          status.style.color = error ? '#b42318' : '#35516d';
+          status.title = error || message;
+        }
+      }
+
+      function restoreOriginal() {
+        runId += 1;
+        translationActive = false;
+        rescanNeeded = false;
+        if (rescanTimer) {
+          window.clearTimeout(rescanTimer);
+          rescanTimer = null;
+        }
+        annotations.forEach((annotation) => annotation.remove());
+        if (observedViewer) {
+          observedViewer.querySelectorAll('.airnavx-translation-note').forEach((annotation) => annotation.remove());
+        }
+        annotations = new Set();
+        notesByNode = new Map();
+        originals = new Map();
+        const button = document.getElementById(buttonId);
+        if (button) {
+          button.textContent = '翻译';
+          button.setAttribute('aria-pressed', 'false');
+        }
+        setStatus('');
+      }
+
+      function textNodesToTranslate(viewer) {
+        const nodes = [];
+        const walker = document.createTreeWalker(viewer, NodeFilter.SHOW_TEXT);
+        let node;
+        while ((node = walker.nextNode())) {
+          const value = node.nodeValue || '';
+          const parent = node.parentElement;
+          if (!/[a-z]{3}/i.test(value) || !parent ||
+              parent.closest('.airnavx-translation-note, .link, [role="link"], a, button, script, style, noscript, svg, [aria-hidden="true"]') ||
+              /^\s*(?:TASK|SUBTASK)\s+\d{2}-\d{2}-/i.test(value) ||
+              !parent.getClientRects().length) {
+            continue;
+          }
+          const range = document.createRange();
+          range.selectNodeContents(node);
+          if (range.getClientRects().length) {
+            nodes.push(node);
+          }
+          range.detach();
+        }
+        return nodes;
+      }
+
+      async function translatePending(viewer, currentRun) {
+        if (translationRunning) {
+          rescanNeeded = true;
+          return;
+        }
+        translationRunning = true;
+        try {
+          const translator = await translatorPromise;
+          let finished = 0;
+          do {
+            rescanNeeded = false;
+            for (const annotation of annotations) {
+              if (!annotation.isConnected) {
+                annotations.delete(annotation);
+              }
+            }
+            for (const node of originals.keys()) {
+              const annotation = notesByNode.get(node);
+              if (!viewer.contains(node) || (annotation && !annotation.isConnected)) {
+                if (!viewer.contains(node) && annotation) {
+                  annotation.remove();
+                  annotations.delete(annotation);
+                }
+                originals.delete(node);
+                notesByNode.delete(node);
+              }
+            }
+            const nodes = textNodesToTranslate(viewer).filter((node) => !originals.has(node));
+            for (const node of nodes) {
+              if (currentRun !== runId || !translationActive) {
+                return;
+              }
+              if (!viewer.contains(node)) {
+                continue;
+              }
+              const original = node.nodeValue;
+              originals.set(node, original);
+              const source = original.trim();
+              let translated = cache.get(source);
+              if (!translated) {
+                translated = await translator.translate(source);
+                cache.set(source, translated);
+              }
+              if (currentRun !== runId || !translationActive) {
+                return;
+              }
+              if (!viewer.contains(node) || node.nodeValue !== original) {
+                originals.delete(node);
+                rescanNeeded = true;
+                continue;
+              }
+              const annotation = document.createElement('span');
+              annotation.className = 'airnavx-translation-note';
+              annotation.lang = 'zh-CN';
+              annotation.textContent = `译：${translated}`;
+              annotation.style.cssText = 'display:block;color:#234e73;font-size:0.96em;line-height:1.5;margin:3px 0 7px;white-space:normal';
+              node.parentNode.insertBefore(annotation, node.nextSibling);
+              annotations.add(annotation);
+              notesByNode.set(node, annotation);
+              finished += 1;
+              setStatus(`翻译中 ${finished}`);
+            }
+          } while (rescanNeeded && currentRun === runId && translationActive);
+          if (currentRun === runId && translationActive) {
+            setStatus('翻译完成 · 中英对照');
+          }
+        } catch (error) {
+          if (currentRun === runId) {
+            restoreOriginal();
+            setStatus('翻译失败，已恢复原文', String(error && error.message || error));
+          }
+        } finally {
+          translationRunning = false;
+          if (rescanNeeded && translationActive) {
+            requestRescan();
+          }
+        }
+      }
+
+      function requestRescan() {
+        if (!translationActive || rescanTimer) {
+          return;
+        }
+        rescanNeeded = true;
+        if (translationRunning) {
+          return;
+        }
+        rescanTimer = window.setTimeout(() => {
+          rescanTimer = null;
+          if (translationActive && observedViewer) {
+            translatePending(observedViewer, runId);
+          }
+        }, 120);
+      }
+
+      function translateDocument(button, viewer) {
+        if (!viewer) {
+          setStatus('右侧暂无可翻译文字');
+          return;
+        }
+        const TranslatorApi = win.Translator || window.Translator;
+        if (!TranslatorApi || typeof TranslatorApi.create !== 'function') {
+          setStatus('当前浏览器不支持本机翻译', '请使用支持 Translator API 的桌面版 Chrome');
+          return;
+        }
+        const nodes = textNodesToTranslate(viewer);
+        if (!nodes.length) {
+          setStatus('右侧暂无可翻译文字');
+          return;
+        }
+
+        const currentRun = ++runId;
+        translationActive = true;
+        button.textContent = '原文';
+        button.setAttribute('aria-pressed', 'true');
+        setStatus(`准备翻译 0/${nodes.length}`);
+
+        // create() starts in the click handler so Chrome can download a language pack when needed.
+        if (!translatorPromise) {
+          translatorPromise = TranslatorApi.create({
+            sourceLanguage: 'en',
+            targetLanguage: 'zh',
+            monitor(monitor) {
+              monitor.addEventListener('downloadprogress', (event) => {
+                if (currentRun === runId) {
+                  setStatus(`下载中文语言包 ${Math.round(event.loaded * 100)}%`);
+                }
+              });
+            }
+          }).catch((error) => {
+            translatorPromise = null;
+            throw error;
+          });
+        }
+        translatePending(viewer, currentRun);
+      }
+
+      function ensureButton() {
+        const toolbar = document.querySelector('#tocRightPanel #toolbar #tool');
+        const viewer = document.querySelector('#tocRightPanel #bindHtmlViewer');
+        if (!toolbar || !viewer) {
+          if (observedViewer && !observedViewer.isConnected) {
+            runId += 1;
+            annotations = new Set();
+            notesByNode = new Map();
+            originals = new Map();
+            rescanNeeded = translationActive;
+            if (translationActive) {
+              setStatus('等待右侧正文加载');
+            }
+            observer.disconnect();
+            observedViewer = null;
+            observer = null;
+          }
+          return;
+        }
+        if (viewer !== observedViewer) {
+          const continueTranslation = translationActive;
+          if (continueTranslation) {
+            runId += 1;
+            annotations.forEach((annotation) => annotation.remove());
+            annotations = new Set();
+            notesByNode = new Map();
+            originals = new Map();
+            rescanNeeded = true;
+            setStatus('正在翻译新正文');
+          } else {
+            restoreOriginal();
+          }
+          if (observer) {
+            observer.disconnect();
+          }
+          observedViewer = viewer;
+          observer = new MutationObserver((mutations) => {
+            const contentChanged = mutations.some((mutation) => mutation.type === 'childList' &&
+              (mutation.removedNodes.length || [...mutation.addedNodes].some((node) =>
+                node.nodeType !== 1 || !node.classList.contains('airnavx-translation-note'))));
+            for (const mutation of mutations) {
+              if (mutation.type === 'characterData' && originals.has(mutation.target) &&
+                  mutation.target.nodeValue !== originals.get(mutation.target)) {
+                const annotation = notesByNode.get(mutation.target);
+                if (annotation) {
+                  annotation.remove();
+                  annotations.delete(annotation);
+                  notesByNode.delete(mutation.target);
+                }
+                originals.delete(mutation.target);
+                requestRescan();
+              }
+            }
+            if (contentChanged) {
+              requestRescan();
+            }
+          });
+          observer.observe(viewer, { childList: true, characterData: true, subtree: true });
+          if (continueTranslation) {
+            requestRescan();
+          }
+        }
+        if (document.getElementById(buttonId)) {
+          return;
+        }
+
+        const button = document.createElement('button');
+        button.id = buttonId;
+        button.type = 'button';
+        button.textContent = translationActive ? '原文' : '翻译';
+        button.title = '显示右侧正文的中英文对照；再点一次仅显示英文原文';
+        button.setAttribute('aria-label', '翻译右侧正文');
+        button.setAttribute('aria-pressed', String(translationActive));
+        button.style.cssText = 'margin:0 8px 0 0;padding:5px 9px;border:1px solid #173b68;border-radius:3px;background:#fff;color:#173b68;font-size:14px;font-weight:600;cursor:pointer;white-space:nowrap';
+        button.addEventListener('click', () => {
+          if (translationActive) {
+            restoreOriginal();
+          } else {
+            translateDocument(button, document.querySelector('#tocRightPanel #bindHtmlViewer'));
+          }
+        });
+
+        const status = document.createElement('span');
+        status.id = statusId;
+        status.setAttribute('role', 'status');
+        status.style.cssText = 'max-width:190px;margin-right:7px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px';
+        toolbar.prepend(status);
+        toolbar.prepend(button);
+      }
+
+      ensureButton();
+      window.setInterval(ensureButton, 1000);
+    }
+
     patchDomEvents();
     patchHistory();
     patchNetwork();
     waitForAngular();
     registerAccessCodeAutoLoginMenu();
     runWhenDomReady(startAccessCodeAutoFill);
+    runWhenDomReady(startDocumentTranslation);
   }
 
   if (location.host === TOOLBOX_HOST && location.pathname === '/raw-message-parser') {
