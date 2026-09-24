@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.16.5
+// @version      1.16.7
 // @description  AMES 工卡/工程评估/MEL备注/报文解析增强、AirNavX 自动处理与手册翻译、Boeing Toolbox 自动继续
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
@@ -2789,11 +2789,130 @@
         }
       }
 
+      const MIN_TRANSLATOR_CHROME_MAJOR = 138;
+      let translatorPlatformInfo = null;
+      let translatorPlatformInfoPromise = null;
+
+      function getChromeMajorVersion() {
+        const ua = String(navigator.userAgent || '');
+        const match = ua.match(/(?:Chrome|Chromium)\/(\d+)/i);
+        return match ? Number(match[1]) : null;
+      }
+
+      function loadTranslatorPlatformInfo() {
+        if (translatorPlatformInfoPromise) {
+          return translatorPlatformInfoPromise;
+        }
+
+        const userAgentData = navigator.userAgentData;
+        const basicInfo = {
+          platform: String((userAgentData && userAgentData.platform) || navigator.platform || ''),
+          architecture: '',
+          bitness: ''
+        };
+
+        if (userAgentData && typeof userAgentData.getHighEntropyValues === 'function') {
+          translatorPlatformInfoPromise = Promise.resolve(
+            userAgentData.getHighEntropyValues(['architecture', 'bitness', 'platformVersion'])
+          ).then((info) => {
+            translatorPlatformInfo = {
+              ...basicInfo,
+              ...info,
+              platform: String(info.platform || basicInfo.platform || ''),
+              architecture: String(info.architecture || ''),
+              bitness: String(info.bitness || '')
+            };
+            return translatorPlatformInfo;
+          }).catch(() => {
+            translatorPlatformInfo = basicInfo;
+            return translatorPlatformInfo;
+          });
+        } else {
+          translatorPlatformInfo = basicInfo;
+          translatorPlatformInfoPromise = Promise.resolve(basicInfo);
+        }
+
+        return translatorPlatformInfoPromise;
+      }
+
+      function isWindowsArm64(info) {
+        const target = info || translatorPlatformInfo;
+        if (!target) {
+          return false;
+        }
+        const platform = String(target.platform || '').toLowerCase();
+        const architecture = String(target.architecture || '').toLowerCase();
+        const bitness = String(target.bitness || '').toLowerCase();
+        return platform.includes('windows') &&
+          (architecture === 'arm' || architecture === 'arm64' || architecture === 'aarch64') &&
+          (!bitness || bitness === '64');
+      }
+
+      function windowsArm64Hint(extra) {
+        return [
+          '检测到 Windows ARM64。',
+          'Chrome 当前未提供可用的 Windows ARM64 TranslateKit 核心翻译组件；即使 en-zh 语言包显示 Installed，也可能无法创建本机翻译器。',
+          '可改用 macOS Chrome 或 Windows x64 Chrome 环境。',
+          '可在 chrome://components/ 查看 Chrome TranslateKit；核心版本 0.0.0.0 表示没有实际安装版本。',
+          extra || ''
+        ].filter(Boolean).join(' ');
+      }
+
+      function setWindowsArm64Unsupported(extra) {
+        setStatus('Windows ARM64 暂不支持本机翻译', windowsArm64Hint(extra));
+      }
+
+      function translatorEnvironmentHint(extra) {
+        if (isWindowsArm64()) {
+          return windowsArm64Hint(extra);
+        }
+        const chromeMajor = getChromeMajorVersion();
+        return [
+          chromeMajor ? `当前 Chrome 主版本：${chromeMajor}` : '未能识别当前 Chrome 版本',
+          'Translator API 需要桌面版 Chrome 138 或更高版本。',
+          '如版本已满足，请检查 chrome://on-device-translation-internals/ 的语言包状态，以及 chrome://policy 中是否有限制本机 AI/模型下载的策略。',
+          extra || ''
+        ].filter(Boolean).join(' ');
+      }
+
       function setTranslatorCreateError(error) {
         const name = String(error && error.name || '').trim();
         const detail = String(error && error.message || error || '未知错误');
-        const label = name && name !== 'Error' ? `Chrome 拒绝：${name}` : '本机翻译未就绪，点击重试';
-        setStatus(label, `${name && name !== 'Error' ? `${name}: ` : ''}${detail}`);
+        const chromeMajor = getChromeMajorVersion();
+
+        if (isWindowsArm64()) {
+          setWindowsArm64Unsupported(`${name || 'Error'}: ${detail}`);
+          return;
+        }
+
+        if (chromeMajor && chromeMajor < MIN_TRANSLATOR_CHROME_MAJOR) {
+          setStatus(
+            `Chrome ${chromeMajor} · 请升级至 ${MIN_TRANSLATOR_CHROME_MAJOR}+`,
+            translatorEnvironmentHint(`${name || 'Error'}: ${detail}`)
+          );
+          return;
+        }
+
+        if (name === 'NotSupportedError') {
+          const availability = error && error.airnavTranslatorAvailability;
+          const availabilityText = availability ? `；availability=${availability}` : '';
+          setStatus(
+            '本机翻译不可用 · 检查环境',
+            translatorEnvironmentHint(`Chrome 返回 NotSupportedError${availabilityText}：${detail}`)
+          );
+
+          // Platform high-entropy values may not have finished loading when the error arrives.
+          // Upgrade the message once Windows ARM64 is confirmed.
+          loadTranslatorPlatformInfo().then((info) => {
+            if (isWindowsArm64(info)) {
+              setWindowsArm64Unsupported(`Chrome 返回 NotSupportedError${availabilityText}：${detail}`);
+            }
+          });
+          return;
+        }
+
+        const label = name && name !== 'Error' ? `本机翻译失败 · ${name}` : '本机翻译未就绪 · 点击重试';
+        setStatus(label, translatorEnvironmentHint(`${name && name !== 'Error' ? `${name}: ` : ''}${detail}`));
       }
 
       function destroyTranslator(translator) {
@@ -2973,9 +3092,29 @@
           setStatus('右侧暂无可翻译文字');
           return;
         }
+        if (isWindowsArm64()) {
+          setWindowsArm64Unsupported('当前环境不调用 Translator.create()，避免重复出现 NotSupportedError。');
+          return;
+        }
+
+        const chromeMajor = getChromeMajorVersion();
+        if (chromeMajor && chromeMajor < MIN_TRANSLATOR_CHROME_MAJOR) {
+          setStatus(
+            `Chrome ${chromeMajor} · 请升级至 ${MIN_TRANSLATOR_CHROME_MAJOR}+`,
+            translatorEnvironmentHint('当前版本低于 Translator API 的稳定版最低版本。')
+          );
+          return;
+        }
+
         const TranslatorApi = win.Translator || window.Translator;
         if (!TranslatorApi || typeof TranslatorApi.create !== 'function') {
-          setStatus('当前浏览器不支持本机翻译', '请使用支持 Translator API 的桌面版 Chrome');
+          const secureHint = window.isSecureContext === false
+            ? '当前页面不是安全上下文（HTTPS），这也可能导致 Translator API 不可用。'
+            : '';
+          setStatus(
+            chromeMajor ? '本机翻译未启用 · 检查设置' : '当前浏览器不支持本机翻译',
+            translatorEnvironmentHint(secureHint || '当前页面未检测到 Translator.create()。')
+          );
           return;
         }
         const nodes = textNodesToTranslate(viewer);
@@ -2989,6 +3128,20 @@
         button.textContent = '原文';
         button.setAttribute('aria-pressed', 'true');
         setStatus(`准备翻译 0/${nodes.length}`);
+
+        // Probe availability without awaiting it here: create() should stay in the original click task
+        // so Chrome can download a language pack when user activation is required.
+        let availabilityPromise = null;
+        if (typeof TranslatorApi.availability === 'function') {
+          try {
+            availabilityPromise = Promise.resolve(TranslatorApi.availability({
+              sourceLanguage: 'en',
+              targetLanguage: 'zh'
+            })).catch(() => null);
+          } catch (_error) {
+            availabilityPromise = Promise.resolve(null);
+          }
+        }
 
         // create() starts in the click handler so Chrome can download a language pack when needed.
         if (!translatorPromise) {
@@ -3006,9 +3159,21 @@
                 });
               }
             }));
-            translatorCreation = creation;
-            creation.then((translator) => {
-              if (translatorCreation === creation) {
+            const diagnosedCreation = creation.catch(async (error) => {
+              if (error && error.name === 'NotSupportedError' && availabilityPromise) {
+                const availability = await availabilityPromise;
+                if (availability) {
+                  error.airnavTranslatorAvailability = availability;
+                  if (!error.message) {
+                    error.message = `Translator availability: ${availability}`;
+                  }
+                }
+              }
+              throw error;
+            });
+            translatorCreation = diagnosedCreation;
+            diagnosedCreation.then((translator) => {
+              if (translatorCreation === diagnosedCreation) {
                 translatorInstance = translator;
               } else {
                 destroyTranslator(translator);
@@ -3028,7 +3193,7 @@
                 reject(error);
               }, 120000);
             });
-            translatorPromise = Promise.race([creation, timeout]).finally(() => {
+            translatorPromise = Promise.race([diagnosedCreation, timeout]).finally(() => {
               window.clearTimeout(hintTimer);
               window.clearTimeout(timeoutTimer);
             });
@@ -3133,6 +3298,7 @@
         toolbar.prepend(button);
       }
 
+      loadTranslatorPlatformInfo();
       ensureButton();
       window.setInterval(ensureButton, 1000);
       window.addEventListener('pagehide', restoreOriginal);
