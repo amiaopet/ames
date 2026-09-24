@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.16.7
+// @version      1.16.8
 // @description  AMES 工卡/工程评估/MEL备注/报文解析增强、AirNavX 自动处理与手册翻译、Boeing Toolbox 自动继续
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
@@ -2780,12 +2780,100 @@
       let rescanNeeded = false;
       let rescanTimer = null;
 
+      const statusDetailId = 'airnavx-translate-status-detail';
+
+      function removeStatusDetail() {
+        const panel = document.getElementById(statusDetailId);
+        if (panel) {
+          panel.remove();
+        }
+      }
+
+      function positionStatusDetail(panel) {
+        if (!panel || !panel.isConnected) {
+          return;
+        }
+        const anchor = document.getElementById(buttonId) || document.getElementById(statusId);
+        if (!anchor) {
+          return;
+        }
+        const gap = 8;
+        const margin = 12;
+        const anchorRect = anchor.getBoundingClientRect();
+        const panelRect = panel.getBoundingClientRect();
+        let left = anchorRect.right - panelRect.width;
+        left = Math.max(margin, Math.min(left, window.innerWidth - panelRect.width - margin));
+        let top = anchorRect.bottom + gap;
+        if (top + panelRect.height > window.innerHeight - margin) {
+          top = Math.max(margin, anchorRect.top - panelRect.height - gap);
+        }
+        panel.style.left = `${Math.round(left)}px`;
+        panel.style.top = `${Math.round(top)}px`;
+      }
+
+      function showStatusDetail(message, detail) {
+        removeStatusDetail();
+        if (!detail) {
+          return;
+        }
+
+        const panel = document.createElement('div');
+        panel.id = statusDetailId;
+        panel.setAttribute('role', 'alert');
+        panel.style.cssText = [
+          'position:fixed',
+          'z-index:2147483647',
+          'box-sizing:border-box',
+          'width:min(560px,calc(100vw - 24px))',
+          'max-height:min(50vh,380px)',
+          'overflow:auto',
+          'padding:12px 38px 12px 14px',
+          'border:1px solid #d92d20',
+          'border-radius:6px',
+          'background:#fff7f6',
+          'color:#7a271a',
+          'box-shadow:0 6px 24px rgba(0,0,0,.20)',
+          'font:13px/1.55 Arial,"Microsoft YaHei",sans-serif',
+          'white-space:normal',
+          'word-break:break-word',
+          'overflow-wrap:anywhere',
+          'user-select:text'
+        ].join(';');
+
+        const title = document.createElement('div');
+        title.textContent = message || '本机翻译提示';
+        title.style.cssText = 'margin-bottom:5px;font-size:14px;font-weight:700;color:#b42318;';
+        panel.appendChild(title);
+
+        const body = document.createElement('div');
+        body.textContent = detail;
+        panel.appendChild(body);
+
+        const close = document.createElement('button');
+        close.type = 'button';
+        close.textContent = '×';
+        close.title = '关闭提示';
+        close.setAttribute('aria-label', '关闭本机翻译提示');
+        close.style.cssText = 'position:absolute;right:9px;top:6px;border:0;background:transparent;color:#7a271a;font-size:22px;line-height:1;cursor:pointer;padding:2px 5px;';
+        close.addEventListener('click', removeStatusDetail);
+        panel.appendChild(close);
+
+        document.body.appendChild(panel);
+        positionStatusDetail(panel);
+        window.requestAnimationFrame(() => positionStatusDetail(panel));
+      }
+
       function setStatus(message, error) {
         const status = document.getElementById(statusId);
         if (status) {
           status.textContent = message;
           status.style.color = error ? '#b42318' : '#35516d';
           status.title = error || message;
+        }
+        if (error) {
+          showStatusDetail(message, error);
+        } else {
+          removeStatusDetail();
         }
       }
 
@@ -2862,14 +2950,30 @@
         setStatus('Windows ARM64 暂不支持本机翻译', windowsArm64Hint(extra));
       }
 
+      function getTranslatorPermissionsPolicyState() {
+        try {
+          if (window.top === window) {
+            return 'top';
+          }
+          const policy = document.permissionsPolicy || document.featurePolicy;
+          if (policy && typeof policy.allowsFeature === 'function') {
+            return policy.allowsFeature('translator') ? 'allowed' : 'blocked';
+          }
+          return 'iframe-unknown';
+        } catch (_error) {
+          return 'iframe-unknown';
+        }
+      }
+
       function translatorEnvironmentHint(extra) {
         if (isWindowsArm64()) {
           return windowsArm64Hint(extra);
         }
         const chromeMajor = getChromeMajorVersion();
         return [
-          chromeMajor ? `当前 Chrome 主版本：${chromeMajor}` : '未能识别当前 Chrome 版本',
-          'Translator API 需要桌面版 Chrome 138 或更高版本。',
+          chromeMajor ? `当前 Chrome 主版本：${chromeMajor}。` : '未能识别当前 Chrome 版本。',
+          `Translator API 需要桌面版 Chrome ${MIN_TRANSLATOR_CHROME_MAJOR} 或更高版本。`,
+          '此功能与“Chrome 设置 → 语言 → 使用 Google 翻译”开关无关。',
           '如版本已满足，请检查 chrome://on-device-translation-internals/ 的语言包状态，以及 chrome://policy 中是否有限制本机 AI/模型下载的策略。',
           extra || ''
         ].filter(Boolean).join(' ');
@@ -2937,6 +3041,7 @@
         runId += 1;
         translationActive = false;
         releaseTranslator();
+        removeStatusDetail();
         rescanNeeded = false;
         if (rescanTimer) {
           window.clearTimeout(rescanTimer);
@@ -3108,12 +3213,42 @@
 
         const TranslatorApi = win.Translator || window.Translator;
         if (!TranslatorApi || typeof TranslatorApi.create !== 'function') {
-          const secureHint = window.isSecureContext === false
-            ? '当前页面不是安全上下文（HTTPS），这也可能导致 Translator API 不可用。'
+          if (window.isSecureContext === false) {
+            setStatus(
+              '当前页面非安全环境 · 请使用 HTTPS',
+              [
+                '当前页面不是安全上下文（window.isSecureContext = false），Chrome 不会在这里开放 Translator API。',
+                '请改用 HTTPS 版 AirNav/AirNavX 页面后再试。',
+                '这个问题与“Chrome 设置 → 语言 → 使用 Google 翻译”开关无关。',
+                `当前地址：${location.href}`
+              ].join(' ')
+            );
+            return;
+          }
+
+          const permissionState = getTranslatorPermissionsPolicyState();
+          if (permissionState === 'blocked') {
+            setStatus(
+              '当前页面未获翻译权限',
+              [
+                '当前页面位于 iframe 中，并且 Permissions Policy 未允许 translator 功能。',
+                '需要由上层页面显式允许 translator 权限，或直接在顶层 HTTPS 页面中打开手册。',
+                '这个问题与“Chrome 设置 → 语言 → 使用 Google 翻译”开关无关。'
+              ].join(' ')
+            );
+            return;
+          }
+
+          const contextHint = permissionState === 'iframe-unknown'
+            ? '当前页面位于 iframe 中，且无法确认 translator 权限状态；可尝试在顶层 HTTPS 页面打开后重试。'
             : '';
           setStatus(
-            chromeMajor ? '本机翻译未启用 · 检查设置' : '当前浏览器不支持本机翻译',
-            translatorEnvironmentHint(secureHint || '当前页面未检测到 Translator.create()。')
+            'Chrome Translator API 不可用',
+            translatorEnvironmentHint([
+              '当前页面未检测到 Translator.create()。',
+              contextHint,
+              '如果 Chrome 已是 138 或更高版本，请优先检查浏览器策略、组件状态，并完全退出 Chrome 后重新启动。'
+            ].filter(Boolean).join(' '))
           );
           return;
         }
@@ -3293,7 +3428,7 @@
         const status = document.createElement('span');
         status.id = statusId;
         status.setAttribute('role', 'status');
-        status.style.cssText = 'max-width:190px;margin-right:7px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px';
+        status.style.cssText = 'display:inline-block;max-width:min(360px,42vw);margin-right:7px;overflow:visible;text-overflow:clip;white-space:normal;word-break:break-word;line-height:1.35;font-size:12px;vertical-align:middle';
         toolbar.prepend(status);
         toolbar.prepend(button);
       }
@@ -3301,6 +3436,12 @@
       loadTranslatorPlatformInfo();
       ensureButton();
       window.setInterval(ensureButton, 1000);
+      window.addEventListener('resize', () => {
+        const panel = document.getElementById(statusDetailId);
+        if (panel) {
+          positionStatusDetail(panel);
+        }
+      });
       window.addEventListener('pagehide', restoreOriginal);
     }
 
