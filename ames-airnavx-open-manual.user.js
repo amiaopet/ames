@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.16.11
+// @version      1.16.12
 // @description  AMES 工卡/工程评估/MEL备注/报文解析增强、AirNavX 手册翻译、Boeing Toolbox 自动继续与本机翻译
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
@@ -3837,9 +3837,19 @@
         translatePending(viewer, currentRun);
       }
 
+      function findRightPane() {
+        const panes = ['#tocRightPanel', '#rightPanel'].map((selector) => ({
+          toolbar: document.querySelector(`${selector} #toolbar #tool`),
+          viewer: document.querySelector(`${selector} #bindHtmlViewer`)
+        })).filter((pane) => pane.toolbar && pane.viewer);
+        return panes.find((pane) => pane.toolbar.getClientRects().length &&
+          pane.viewer.getClientRects().length) || panes[0] || null;
+      }
+
       function ensureButton() {
-        const toolbar = document.querySelector('#tocRightPanel #toolbar #tool');
-        const viewer = document.querySelector('#tocRightPanel #bindHtmlViewer');
+        const pane = findRightPane();
+        const toolbar = pane && pane.toolbar;
+        const viewer = pane && pane.viewer;
         if (!toolbar || !viewer) {
           if (observedViewer && !observedViewer.isConnected) {
             runId += 1;
@@ -3899,11 +3909,17 @@
             requestRescan();
           }
         }
-        if (document.getElementById(buttonId)) {
+        const existingButton = document.getElementById(buttonId);
+        const existingStatus = document.getElementById(statusId);
+        if (existingButton && existingStatus) {
+          if (existingButton.parentElement !== toolbar || existingStatus.parentElement !== toolbar) {
+            toolbar.prepend(existingStatus);
+            toolbar.prepend(existingButton);
+          }
           return;
         }
 
-        const button = document.createElement('button');
+        const button = existingButton || document.createElement('button');
         button.id = buttonId;
         button.type = 'button';
         button.textContent = translationActive ? '原文' : '翻译';
@@ -3911,15 +3927,18 @@
         button.setAttribute('aria-label', '翻译右侧正文');
         button.setAttribute('aria-pressed', String(translationActive));
         button.style.cssText = 'margin:0 8px 0 0;padding:5px 9px;border:1px solid #173b68;border-radius:3px;background:#fff;color:#173b68;font-size:14px;font-weight:600;cursor:pointer;white-space:nowrap';
-        button.addEventListener('click', () => {
-          if (translationActive) {
-            restoreOriginal();
-          } else {
-            translateDocument(button, document.querySelector('#tocRightPanel #bindHtmlViewer'));
-          }
-        });
+        if (!existingButton) {
+          button.addEventListener('click', () => {
+            if (translationActive) {
+              restoreOriginal();
+            } else {
+              const currentPane = findRightPane();
+              translateDocument(button, currentPane && currentPane.viewer);
+            }
+          });
+        }
 
-        const status = document.createElement('span');
+        const status = existingStatus || document.createElement('span');
         status.id = statusId;
         status.setAttribute('role', 'status');
         status.style.cssText = 'display:inline-block;max-width:min(360px,42vw);margin-right:7px;overflow:visible;text-overflow:clip;white-space:normal;word-break:break-word;line-height:1.35;font-size:12px;vertical-align:middle';
