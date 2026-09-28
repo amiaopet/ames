@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.16.8
-// @description  AMES 工卡/工程评估/MEL备注/报文解析增强、AirNavX 自动处理与手册翻译、Boeing Toolbox 自动继续
+// @version      1.16.11
+// @description  AMES 工卡/工程评估/MEL备注/报文解析增强、AirNavX 手册翻译、Boeing Toolbox 自动继续与本机翻译
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
 // @match        https://ames.juneyaoair.com/mnt/ftp/tdms/manual/*
@@ -10,6 +10,7 @@
 // @match        https://airnavx.juneyaoair.com/airnavx*
 // @match        http://airnav.juneyaoair.com:8000/*
 // @match        http://boeingtoolbox.juneyaoair.com:8080/toolboxremote.html*
+// @match        https://boeingtoolbox.juneyaoair.com/*
 // @updateURL    https://raw.githubusercontent.com/amiaopet/ames/main/ames-airnavx-open-manual.user.js
 // @downloadURL  https://raw.githubusercontent.com/amiaopet/ames/main/ames-airnavx-open-manual.user.js
 // @grant        unsafeWindow
@@ -17,6 +18,9 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_deleteValue
+// @grant        GM_openInTab
+// @grant        GM_addValueChangeListener
+// @grant        GM_removeValueChangeListener
 // @grant        GM_registerMenuCommand
 // @connect      ames.juneyaoair.com
 // @connect      172.29.92.15
@@ -2342,6 +2346,496 @@
     });
   }
 
+  function runBoeingToolboxTranslatorHelper() {
+    const session = location.hash.match(/^#xiaoma-translate\/([a-z0-9-]+)$/i);
+    if (!session) {
+      return;
+    }
+
+    const sessionId = session[1];
+    const channel = 'xiaoma-boeing-translate';
+    const inboxKey = `${channel}:${sessionId}:helper`;
+    const outboxKey = `${channel}:${sessionId}:parent`;
+    let translator = null;
+    let creating = false;
+    let needsActivation = false;
+    let waiters = [];
+    let queue = Promise.resolve();
+    let status;
+    let activate;
+    let messageSequence = 0;
+
+    function post(kind, data = {}) {
+      GM_setValue(outboxKey, { channel, sessionId, kind, sequence: ++messageSequence, ...data });
+    }
+
+    function setStatus(message, kind = 'status') {
+      if (status) {
+        status.textContent = message;
+      }
+      post(kind, { message });
+    }
+
+    function settleWaiters(error) {
+      const current = waiters;
+      waiters = [];
+      current.forEach(({ resolve, reject }) => error ? reject(error) : resolve(translator));
+    }
+
+    function waitForTranslator() {
+      if (translator) {
+        return Promise.resolve(translator);
+      }
+      return new Promise((resolve, reject) => waiters.push({ resolve, reject }));
+    }
+
+    function createTranslator() {
+      if (creating || translator) {
+        return;
+      }
+      const Api = window.Translator;
+      if (!Api || typeof Api.create !== 'function') {
+        const error = new Error('这个 Chrome 的 HTTPS 页面没有 Translator API。请检查桌面版 Chrome 版本和浏览器策略。');
+        setStatus(error.message, 'error');
+        settleWaiters(error);
+        return;
+      }
+      creating = true;
+      needsActivation = false;
+      activate.disabled = true;
+      setStatus('正在准备 Chrome 本机翻译');
+      let creation;
+      try {
+        // Keep create() in the click task: Chrome may require user activation for model download.
+        creation = Api.create({
+          sourceLanguage: 'en',
+          targetLanguage: 'zh',
+          monitor(monitor) {
+            monitor.addEventListener('downloadprogress', (event) => {
+              setStatus(`正在下载英译中语言包 ${Math.round(event.loaded * 100)}%`);
+            });
+          }
+        });
+      } catch (error) {
+        creation = Promise.reject(error);
+      }
+      Promise.resolve(creation).then((instance) => {
+        translator = instance;
+        creating = false;
+        activate.hidden = true;
+        setStatus('本机翻译已就绪');
+        settleWaiters();
+      }, (error) => {
+        creating = false;
+        needsActivation = true;
+        activate.disabled = false;
+        const detail = `${error && error.name || 'Error'}: ${error && error.message || error}`;
+        setStatus(`本机翻译启动失败：${detail}。点击重试。`, 'error');
+        settleWaiters(error);
+      });
+    }
+
+    async function handleBatch(data) {
+      const instance = await waitForTranslator();
+      const results = [];
+      for (const item of data.items) {
+        results.push({ id: item.id, text: await instance.translate(item.text) });
+      }
+      post('result', { requestId: data.requestId, results });
+    }
+
+    const listenerId = GM_addValueChangeListener(inboxKey, (_key, _oldValue, data, remote) => {
+      if (!remote || !data || data.channel !== channel || data.sessionId !== sessionId) {
+        return;
+      }
+      GM_deleteValue(inboxKey);
+      if (data.kind === 'ping') {
+        post('ready');
+        if (needsActivation) {
+          post('activation-required');
+        }
+      } else if (data.kind === 'batch' && Array.isArray(data.items)) {
+        queue = queue.then(() => handleBatch(data)).catch((error) => {
+          post('batch-error', {
+            requestId: data.requestId,
+            message: `${error && error.name || 'Error'}: ${error && error.message || error}`
+          });
+        });
+      }
+    });
+
+    runWhenDomReady(() => {
+      document.title = '787 工卡 · Chrome 本机翻译';
+      document.body.innerHTML = '';
+      document.body.style.cssText = 'margin:22px;font:14px/1.6 Arial,"Microsoft YaHei",sans-serif;color:#23364a';
+      const heading = document.createElement('h2');
+      heading.textContent = '787 工卡本机翻译';
+      heading.style.cssText = 'margin:0 0 12px;font-size:20px';
+      status = document.createElement('p');
+      status.setAttribute('role', 'status');
+      status.textContent = '正在检查英译中语言包';
+      activate = document.createElement('button');
+      activate.type = 'button';
+      activate.textContent = '启用本机翻译 / 重试';
+      activate.style.cssText = 'padding:8px 14px;border:0;border-radius:4px;background:#1274b8;color:white;cursor:pointer';
+      activate.addEventListener('click', createTranslator);
+      const tip = document.createElement('p');
+      tip.textContent = '翻译在 Chrome 本机完成。首次使用可能需要下载语言包。请在翻译期间保持此窗口打开。';
+      tip.style.cssText = 'color:#617284;font-size:12px';
+      document.body.append(heading, status, activate, tip);
+      post('ready');
+
+      const Api = window.Translator;
+      if (!Api || typeof Api.create !== 'function') {
+        createTranslator();
+      } else if (typeof Api.availability === 'function') {
+        Promise.resolve(Api.availability({ sourceLanguage: 'en', targetLanguage: 'zh' })).then((availability) => {
+          if (availability === 'available') {
+            createTranslator();
+          } else if (availability === 'downloadable' || availability === 'downloading') {
+            needsActivation = true;
+            setStatus('语言包尚未就绪，请点击“启用本机翻译”');
+            post('activation-required');
+          } else {
+            setStatus(`英译中当前不可用：${availability}`, 'error');
+          }
+        }).catch(() => setStatus('无法检查语言包，请点击“启用本机翻译”重试', 'error'));
+      }
+    });
+
+    window.addEventListener('pagehide', () => {
+      GM_removeValueChangeListener(listenerId);
+      GM_deleteValue(inboxKey);
+      if (translator && typeof translator.destroy === 'function') {
+        translator.destroy();
+      }
+    });
+  }
+
+  function startBoeingToolboxTranslation() {
+    const channel = 'xiaoma-boeing-translate';
+    const sessionId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    const inboxKey = `${channel}:${sessionId}:parent`;
+    const outboxKey = `${channel}:${sessionId}:helper`;
+    const helperOrigin = 'https://boeingtoolbox.juneyaoair.com';
+    const helperUrl = `${helperOrigin}/#xiaoma-translate/${sessionId}`;
+    const buttonId = 'xiaoma-boeing-translate-button';
+    const statusId = 'xiaoma-boeing-translate-status';
+    const noteClass = 'xiaoma-boeing-translation-note';
+    const cache = new Map();
+    let helper = null;
+    let helperReady = false;
+    let helperNeedsActivation = false;
+    let helperForeground = false;
+    let messageSequence = 0;
+    let active = false;
+    let root = null;
+    let processing = false;
+    let generation = 0;
+    let requestNumber = 0;
+    let pendingRequest = null;
+    let processed = new WeakMap();
+    let notesByNode = new WeakMap();
+
+    function sendToHelper(kind, data = {}) {
+      GM_setValue(outboxKey, { channel, sessionId, kind, sequence: ++messageSequence, ...data });
+    }
+
+    function setStatus(message, error = false) {
+      const element = document.getElementById(statusId);
+      if (element) {
+        element.textContent = message;
+        element.title = message;
+        element.style.color = error ? '#ffd5d5' : '#fff';
+        element.style.cursor = helperNeedsActivation && !helperForeground ? 'pointer' : 'default';
+        element.style.textDecoration = helperNeedsActivation && !helperForeground ? 'underline' : 'none';
+        element.tabIndex = helperNeedsActivation && !helperForeground ? 0 : -1;
+      }
+    }
+
+    function clearTranslations() {
+      generation += 1;
+      active = false;
+      helperNeedsActivation = false;
+      GM_deleteValue(inboxKey);
+      GM_deleteValue(outboxKey);
+      processed = new WeakMap();
+      notesByNode = new WeakMap();
+      if (pendingRequest) {
+        const request = pendingRequest;
+        pendingRequest = null;
+        window.clearTimeout(request.timer);
+        request.reject(new Error('已取消翻译'));
+      }
+      document.querySelectorAll(`.${noteClass}`).forEach((note) => note.remove());
+      const button = document.getElementById(buttonId);
+      if (button) {
+        button.textContent = '翻译';
+        button.setAttribute('aria-pressed', 'false');
+      }
+      setStatus('');
+    }
+
+    function candidates(viewer) {
+      const nodes = [];
+      const walker = document.createTreeWalker(viewer, NodeFilter.SHOW_TEXT);
+      let node;
+      while ((node = walker.nextNode())) {
+        const value = String(node.nodeValue || '').trim();
+        const parent = node.parentElement;
+        if (processed.has(node) && processed.get(node) !== node.nodeValue) {
+          const oldNote = notesByNode.get(node);
+          if (oldNote) {
+            oldNote.remove();
+          }
+          processed.delete(node);
+          notesByNode.delete(node);
+        }
+        if (!parent || !/[a-z]{3}/i.test(value) || processed.has(node) ||
+            parent.closest(`.${noteClass}, a, button, script, style, noscript, svg, [aria-hidden="true"], .ng-hide`) ||
+            /^\s*(?:AMM|TASK|SUBTASK|DMC-B787-A-)\s*[\d-]+\s*$/i.test(value) ||
+            !parent.getClientRects().length) {
+          continue;
+        }
+        nodes.push(node);
+      }
+      return nodes;
+    }
+
+    function addTranslation(node, original, translated) {
+      if (!root || !root.contains(node) || node.nodeValue !== original) {
+        return;
+      }
+      processed.set(node, original);
+      if (!translated || translated.trim() === original.trim()) {
+        return;
+      }
+      const note = document.createElement('span');
+      note.className = noteClass;
+      note.lang = 'zh-CN';
+      note.textContent = `译：${translated}`;
+      note.style.cssText = 'display:block;margin:2px 0 5px;color:#255477;font:normal 0.95em/1.45 Arial,"Microsoft YaHei",sans-serif;white-space:normal';
+      node.parentNode.insertBefore(note, node.nextSibling);
+      notesByNode.set(node, note);
+    }
+
+    function requestBatch(items) {
+      return new Promise((resolve, reject) => {
+        const requestId = ++requestNumber;
+        const timer = window.setTimeout(() => {
+          pendingRequest = null;
+          reject(new Error('本机翻译等待超时。请检查辅助窗口中的语言包状态。'));
+        }, 180000);
+        pendingRequest = { requestId, items, resolve, reject, timer };
+        sendToHelper('batch', { requestId, items });
+      });
+    }
+
+    async function translatePending() {
+      if (!active || !root || !helperReady || processing) {
+        return;
+      }
+      processing = true;
+      const currentGeneration = generation;
+      let finished = 0;
+      try {
+        while (active && currentGeneration === generation && root.isConnected) {
+          const nodes = candidates(root);
+          if (!nodes.length) {
+            setStatus(`翻译完成 · 中英对照${finished ? ` ${finished}` : ''}`);
+            break;
+          }
+          const batch = nodes.slice(0, 10).map((node, id) => ({ id, node, original: node.nodeValue, text: node.nodeValue.trim() }));
+          const missing = batch.filter((item) => !cache.has(item.text));
+          if (missing.length) {
+            setStatus(`翻译中 ${finished}/${finished + nodes.length}`);
+            const results = await requestBatch(missing.map(({ id, text }) => ({ id, text })));
+            if (!active || currentGeneration !== generation) {
+              break;
+            }
+            results.forEach((result) => {
+              const item = batch.find((entry) => entry.id === result.id);
+              if (item && typeof result.text === 'string') {
+                cache.set(item.text, result.text);
+              }
+            });
+          }
+          if (!active || currentGeneration !== generation) {
+            break;
+          }
+          batch.forEach((item) => {
+            if (cache.has(item.text)) {
+              addTranslation(item.node, item.original, cache.get(item.text));
+              finished += 1;
+            }
+          });
+        }
+      } catch (error) {
+        if (currentGeneration === generation) {
+          clearTranslations();
+          setStatus(`翻译失败：${error && error.message || error}`, true);
+        }
+      } finally {
+        processing = false;
+      }
+    }
+
+    function openHelper(foreground = false) {
+      if (foreground && helper && !helper.closed) {
+        helper.close();
+        helper = null;
+      }
+      if (!helper || helper.closed) {
+        helperReady = false;
+        helperNeedsActivation = false;
+        helperForeground = foreground;
+        try {
+          helper = GM_openInTab(helperUrl, { active: foreground, insert: true, setParent: true });
+        } catch (error) {
+          clearTranslations();
+          setStatus(`无法打开翻译标签：${error && error.message || error}`, true);
+          return;
+        }
+      }
+      if (!helper) {
+        clearTranslations();
+        setStatus('Tampermonkey 未能打开翻译标签，请检查扩展权限。', true);
+        return;
+      }
+      sendToHelper('ping');
+      setStatus(foreground ? '请在新标签点击“启用本机翻译”' : '等待后台翻译标签');
+    }
+
+    const listenerId = GM_addValueChangeListener(inboxKey, (_key, _oldValue, data, remote) => {
+      if (!remote || !data || data.channel !== channel || data.sessionId !== sessionId) {
+        return;
+      }
+      GM_deleteValue(inboxKey);
+      if (data.kind === 'ready') {
+        helperReady = true;
+        if (pendingRequest) {
+          sendToHelper('batch', { requestId: pendingRequest.requestId, items: pendingRequest.items });
+        } else {
+          translatePending();
+        }
+      } else if (data.kind === 'activation-required') {
+        if (active) {
+          helperNeedsActivation = true;
+          setStatus(helperForeground
+            ? '请在翻译标签点击“启用本机翻译”'
+            : '语言包未就绪 · 点击这里打开翻译标签启用');
+        }
+      } else if (data.kind === 'status' || data.kind === 'error') {
+        if (!active) {
+          return;
+        }
+        if (data.kind === 'status' && data.message === '本机翻译已就绪') {
+          helperNeedsActivation = false;
+        }
+        if (data.kind === 'error' && active && !pendingRequest) {
+          clearTranslations();
+        }
+        setStatus(helperNeedsActivation && data.kind === 'status'
+          ? (helperForeground ? '请在翻译标签点击“启用本机翻译”' : '语言包未就绪 · 点击这里打开翻译标签启用')
+          : data.message, data.kind === 'error');
+      } else if (pendingRequest && data.requestId === pendingRequest.requestId) {
+        const request = pendingRequest;
+        pendingRequest = null;
+        window.clearTimeout(request.timer);
+        if (data.kind === 'result') {
+          request.resolve(data.results);
+        } else if (data.kind === 'batch-error') {
+          request.reject(new Error(data.message));
+        }
+      }
+    });
+
+    function ensureButton() {
+      const viewer = document.querySelector('#tb_documentContent #WkwebScrollStyle');
+      const toolbar = document.querySelector('#tbToolbar .toolbar_color_white');
+      if (viewer !== root) {
+        generation += 1;
+        document.querySelectorAll(`.${noteClass}`).forEach((note) => note.remove());
+        root = viewer;
+        processed = new WeakMap();
+        notesByNode = new WeakMap();
+        if (active && root) {
+          setStatus('正在翻译新工卡');
+        }
+      }
+      if (!toolbar || !viewer || document.getElementById(buttonId)) {
+        if (active && helperReady) {
+          translatePending();
+        }
+        return;
+      }
+      const button = document.createElement('button');
+      button.id = buttonId;
+      button.type = 'button';
+      button.textContent = active ? '原文' : '翻译';
+      button.title = '中英对照显示工卡正文；再次点击恢复英文原文';
+      button.setAttribute('aria-pressed', String(active));
+      button.style.cssText = 'float:right;margin:4px 8px 0 0;padding:3px 13px;height:28px;border:1px solid #fff;border-radius:3px;background:transparent;color:#fff;font:600 14px Arial,"Microsoft YaHei",sans-serif;cursor:pointer;position:relative;z-index:2';
+      button.addEventListener('click', () => {
+        if (active) {
+          clearTranslations();
+        } else {
+          active = true;
+          generation += 1;
+          button.textContent = '原文';
+          button.setAttribute('aria-pressed', 'true');
+          openHelper();
+          if (helperReady) {
+            translatePending();
+          }
+        }
+      });
+      const status = document.createElement('span');
+      status.id = statusId;
+      status.setAttribute('role', 'status');
+      status.tabIndex = -1;
+      status.style.cssText = 'float:right;margin:10px 8px 0 0;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#fff;font-size:12px';
+      const activateHelperTab = () => {
+        if (active && helperNeedsActivation && !helperForeground) {
+          openHelper(true);
+        }
+      };
+      status.addEventListener('click', activateHelperTab);
+      status.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          activateHelperTab();
+        }
+      });
+      toolbar.append(button, status);
+      if (active && helperReady) {
+        translatePending();
+      }
+    }
+
+    runWhenDomReady(() => {
+      ensureButton();
+      window.setInterval(() => {
+        ensureButton();
+        if (active && helper && helper.closed) {
+          clearTranslations();
+          setStatus('后台翻译标签已关闭，点击翻译可重试。', true);
+        } else if (active && helper && !helperReady) {
+          sendToHelper('ping');
+        }
+      }, 1000);
+    });
+    window.addEventListener('pagehide', () => {
+      clearTranslations();
+      GM_removeValueChangeListener(listenerId);
+      GM_deleteValue(inboxKey);
+      GM_deleteValue(outboxKey);
+      if (helper && !helper.closed) {
+        helper.close();
+      }
+    });
+  }
+
   function runAirNavEnhancements() {
     const win = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
     const pnTag = '[AirNav PN]';
@@ -3463,8 +3957,11 @@
       startRawMessageInitialQueryGuard();
       runWhenDomReady(startAmesEnhancements);
     }
+  } else if (location.hostname === 'boeingtoolbox.juneyaoair.com' && location.protocol === 'https:') {
+    runBoeingToolboxTranslatorHelper();
   } else if (location.hostname === 'boeingtoolbox.juneyaoair.com') {
     runBoeingToolboxAutoContinue();
+    startBoeingToolboxTranslation();
   } else if (location.hostname === 'airnavx.juneyaoair.com' || location.host === 'airnav.juneyaoair.com:8000') {
     runAirNavEnhancements();
   }
