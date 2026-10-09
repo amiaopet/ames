@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.16.12
+// @version      1.16.19
 // @description  AMES 工卡/工程评估/MEL备注/报文解析增强、AirNavX 手册翻译、Boeing Toolbox 自动继续与本机翻译
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
@@ -64,6 +64,10 @@
   const CMP_HEADER = 'CMP号';
   const CMP_REFERENCE_HEADER = '参考资料';
   const CMP_REFERENCE_COLUMN_WIDTH = 92;
+  const AIRCRAFT_FSN_MIN_WIDTH = 44;
+  const AIRCRAFT_FSN_MAX_WIDTH = 160;
+  const AIRCRAFT_FSN_CELL_CLASS = 'airnavx-aircraft-fsn-cell';
+  const AIRCRAFT_FSN_POPOVER_ID = 'airnavx-aircraft-fsn-summary-popover';
   const JOBCARD_NO_HEADER = '工卡号';
   const JOBCARD_VERSION_HEADER = '工卡版本';
   const SMJC_LIST_PATH = '/api/v1/plugins/TD_JC_SMJC_LIST';
@@ -1214,6 +1218,476 @@
     return contentNode ? getCellPlainText(contentNode) : '';
   }
 
+  const aircraftFsns = new Map();
+  let aircraftFsnsLoadedAt = 0;
+  let aircraftFsnsLoadPromise = null;
+  let aircraftFsnsRetryAfter = 0;
+  let aircraftFsnsLastError = '';
+  const aircraftFsnGridSummaries = new WeakMap();
+
+  function normalizeAircraftRegistration(value) {
+    const text = normalizeDash(cleanText(value)).toUpperCase().replace(/\s+/g, '');
+    const match = text.match(/^(?:B-?)?([A-Z0-9]{4,6})$/);
+    return match ? `B-${match[1]}` : '';
+  }
+
+  function formatFsnRanges(values) {
+    const numbers = Array.from(new Set(values.map(Number).filter(Number.isSafeInteger)))
+      .sort((left, right) => left - right);
+    const ranges = [];
+    for (const value of numbers) {
+      const last = ranges[ranges.length - 1];
+      if (last && value === last[1] + 1) {
+        last[1] = value;
+      } else {
+        ranges.push([value, value]);
+      }
+    }
+    return ranges.map(([first, last]) => `${first}-${last}`).join(',');
+  }
+
+  function getAircraftFsnSummary(registrations) {
+    return formatFsnRanges(registrations.map((registration) => {
+      const record = aircraftFsns.get(normalizeAircraftRegistration(registration));
+      return record && !record.retired ? record.fsn : '';
+    }).filter((fsn) => /^\d+$/.test(fsn)));
+  }
+
+  function getAircraftGridData(bodyTable, targetDocument, registrationHeader) {
+    const grid = bodyTable.closest('.datagrid-wrap');
+    const source = grid?.querySelector('table.datagrid-f');
+    const pageWindow = targetDocument === document && typeof unsafeWindow !== 'undefined'
+      ? unsafeWindow : targetDocument.defaultView;
+    const $ = pageWindow?.jQuery || pageWindow?.$;
+    if (!source || !$?.fn?.datagrid) {
+      return null;
+    }
+    try {
+      const options = $(source).datagrid('options');
+      const data = $(source).datagrid('getData');
+      const field = registrationHeader.getAttribute('field');
+      if (!field || !Array.isArray(data?.rows)) {
+        return null;
+      }
+      return { options, data, field, pageWindow };
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function getAircraftGridRegistrations(bodyTable, targetDocument, registrationHeader) {
+    const gridData = getAircraftGridData(bodyTable, targetDocument, registrationHeader);
+    if (!gridData) {
+      return null;
+    }
+    const { options, data, field, pageWindow } = gridData;
+    const rows = data.rows;
+    const total = Number(data.total);
+    if (Number.isSafeInteger(total) && rows.length >= total) {
+      return rows.map((row) => row?.[field]);
+    }
+    if (!options.url || !pageWindow?.fetch || !Number.isSafeInteger(total) || total < 0) {
+      return null;
+    }
+
+    const scope = bodyTable.closest('.datagrid-view') || bodyTable;
+    const pageSize = Math.max(1, Number(options.pageSize) || rows.length || 20);
+    const fingerprint = JSON.stringify([options.url, options.method, options.queryParams,
+      options.sortName, options.sortOrder, total, pageSize, field]);
+    const previous = aircraftFsnGridSummaries.get(scope);
+    if (previous?.fingerprint === fingerprint && Date.now() - previous.startedAt < 60000) {
+      return previous.registrations || null;
+    }
+    const state = { fingerprint, startedAt: Date.now(), registrations: null };
+    aircraftFsnGridSummaries.set(scope, state);
+    const readPages = async () => {
+      const allRows = [];
+      const pages = Math.ceil(total / pageSize);
+      for (let page = 1; page <= pages; page += 1) {
+        const params = new URLSearchParams(options.queryParams || {});
+        params.set('page', String(page));
+        params.set('rows', String(pageSize));
+        if (options.sortName) {
+          params.set('sort', options.sortName);
+          params.set('order', options.sortOrder || 'asc');
+        }
+        const method = String(options.method || 'post').toUpperCase();
+        const url = new URL(options.url, targetDocument.location.href);
+        if (method === 'GET') {
+          params.forEach((value, key) => url.searchParams.set(key, value));
+        }
+        const response = await pageWindow.fetch(url.href, {
+          method,
+          credentials: 'same-origin',
+          ...(method === 'GET' ? {} : {
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+            body: params.toString()
+          })
+        });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const result = await response.json();
+        const pageRows = Array.isArray(result.data) ? result.data : result.data?.DG_ROWS;
+        if (Number(result.code) !== 200 || !Array.isArray(pageRows)) {
+          throw new Error('分页结果格式不正确');
+        }
+        allRows.push(...pageRows);
+      }
+      if (allRows.length < total) {
+        throw new Error(`只取得 ${allRows.length}/${total} 条记录`);
+      }
+      if (aircraftFsnGridSummaries.get(scope) === state) {
+        state.registrations = allRows.map((row) => row?.[field]);
+        enhanceTables();
+      }
+    };
+    void readPages().catch((error) => {
+      state.error = String(error?.message || error);
+      console.warn('读取 AMES 表格全部分页失败', error);
+    });
+    return null;
+  }
+
+  async function loadAircraftFsns() {
+    if (aircraftFsnsLoadPromise || Date.now() < aircraftFsnsRetryAfter ||
+        (aircraftFsnsLoadedAt && Date.now() - aircraftFsnsLoadedAt < 10 * 60 * 1000)) {
+      return;
+    }
+
+    aircraftFsnsLoadPromise = (async () => {
+      const nextFsns = new Map();
+      let totalPages = 1;
+      for (let page = 1; page <= totalPages; page += 1) {
+        const url = new URL('/api/aircraft-master/search', TOOLBOX_BASE);
+        url.searchParams.set('show_retired', 'true');
+        url.searchParams.set('page_size', '1000');
+        url.searchParams.set('page', String(page));
+        const response = await toolboxRequest({ url: url.href });
+        if (response.status < 200 || response.status >= 300) {
+          throw new Error(`飞机主数据请求失败：HTTP ${response.status}`);
+        }
+        const result = JSON.parse(response.responseText || 'null');
+        if (!result || result.success !== true || !Array.isArray(result.data?.aircraft)) {
+          throw new Error('飞机主数据返回格式不正确');
+        }
+        result.data.aircraft.forEach((aircraft) => {
+          const registration = normalizeAircraftRegistration(aircraft['机号']);
+          const fsn = cleanText(String(aircraft.FSN ?? ''));
+          if (registration && /^\d+$/.test(fsn)) {
+            // Conflicting master records must not produce an arbitrary FSN.
+            const previous = nextFsns.get(registration);
+            nextFsns.set(registration, previous && previous.fsn !== fsn
+              ? { fsn: '', retired: false }
+              : { fsn, retired: Boolean(previous?.retired || cleanText(aircraft['实际退出时间'])) });
+          }
+        });
+        totalPages = Math.max(1, Math.ceil(Number(result.data.pagination?.total_pages) || 1));
+      }
+      aircraftFsns.clear();
+      nextFsns.forEach((record, registration) => aircraftFsns.set(registration, record));
+      aircraftFsnsLoadedAt = Date.now();
+      aircraftFsnsLastError = '';
+      enhanceTables();
+    })().catch((error) => {
+      aircraftFsnsRetryAfter = Date.now() + 30000;
+      aircraftFsnsLastError = String(error && error.message || error);
+      console.warn('加载飞机主数据 FSN 失败', error);
+    }).finally(() => {
+      aircraftFsnsLoadPromise = null;
+    });
+    await aircraftFsnsLoadPromise;
+  }
+
+  async function copyAircraftFsnSummary(value, targetDocument) {
+    const clipboard = targetDocument.defaultView?.navigator?.clipboard;
+    if (clipboard?.writeText) {
+      try {
+        await clipboard.writeText(value);
+        return true;
+      } catch (error) {
+        // Some AMES browser profiles block the Clipboard API; try the selection fallback.
+      }
+    }
+    const textarea = targetDocument.createElement('textarea');
+    textarea.value = value;
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    targetDocument.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    let copied = false;
+    try {
+      copied = Boolean(targetDocument.execCommand('copy'));
+    } catch (error) {
+      copied = false;
+    }
+    textarea.remove();
+    return copied;
+  }
+
+  function showAircraftFsnCopyResult(targetDocument, anchor, message) {
+    const toast = targetDocument.createElement('div');
+    toast.className = 'airnavx-fsn-copy-toast';
+    toast.textContent = message;
+    toast.style.cssText = 'position:fixed;z-index:2147483647;padding:6px 10px;'
+      + 'border-radius:4px;background:#263c5a;color:#fff;font-size:12px;'
+      + 'box-shadow:0 2px 8px #0003;pointer-events:none;max-width:260px;';
+    const rect = anchor.getBoundingClientRect();
+    toast.style.left = `${Math.max(8, rect.left)}px`;
+    toast.style.top = `${rect.bottom + 6}px`;
+    targetDocument.body.appendChild(toast);
+    targetDocument.defaultView.setTimeout(() => toast.remove(), 1800);
+  }
+
+  function updateAircraftFsnPopover(popover, trigger) {
+    const summary = trigger.__airnavxFsnSummary;
+    popover.__airnavxSummary = summary;
+    const text = summary || trigger.__airnavxFsnStatus;
+    if (popover.__airnavxContent.textContent !== text) {
+      popover.__airnavxContent.textContent = text;
+    }
+    const copyDisplay = summary ? '' : 'none';
+    if (popover.__airnavxCopyButton.style.display !== copyDisplay) {
+      popover.__airnavxCopyButton.style.display = copyDisplay;
+    }
+  }
+
+  function closeAircraftFsnPopover(popover) {
+    if (!popover) {
+      return;
+    }
+    popover.__airnavxOutsideDocuments?.forEach((target) => {
+      target.removeEventListener('click', popover.__airnavxOutsideClick, true);
+    });
+    popover.remove();
+  }
+
+  function bindAircraftFsnSummaryButton(trigger, targetDocument) {
+    if (trigger.__airnavxFsnButtonBound) {
+      return;
+    }
+    trigger.__airnavxFsnButtonBound = true;
+    trigger.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const existing = targetDocument.getElementById(AIRCRAFT_FSN_POPOVER_ID);
+      if (existing) {
+        closeAircraftFsnPopover(existing);
+        if (existing.__airnavxSource === trigger) {
+          return;
+        }
+      }
+
+      const popover = targetDocument.createElement('div');
+      popover.id = AIRCRAFT_FSN_POPOVER_ID;
+      popover.__airnavxSource = trigger;
+      popover.style.cssText = 'position:fixed;z-index:2147483646;width:min(420px,calc(100vw - 16px));'
+        + 'box-sizing:border-box;padding:12px;border:1px solid #b7c7d8;border-radius:6px;'
+        + 'background:#fff;color:#24364b;box-shadow:0 4px 16px #0003;font-size:13px;';
+      const heading = targetDocument.createElement('div');
+      heading.textContent = '未退租飞机 FSN 汇总';
+      heading.style.cssText = 'font-weight:bold;margin-bottom:8px;';
+      const content = targetDocument.createElement('div');
+      content.style.cssText = 'max-height:240px;overflow:auto;user-select:text;'
+        + 'white-space:normal;overflow-wrap:anywhere;line-height:1.5;';
+      const actions = targetDocument.createElement('div');
+      actions.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;margin-top:10px;';
+      const copyButton = targetDocument.createElement('button');
+      copyButton.type = 'button';
+      copyButton.textContent = '复制汇总';
+      const closeButton = targetDocument.createElement('button');
+      closeButton.type = 'button';
+      closeButton.textContent = '关闭';
+      [copyButton, closeButton].forEach((button) => {
+        button.style.cssText = 'cursor:pointer;padding:3px 10px;border:1px solid #9eafc2;'
+          + 'border-radius:4px;background:#f5f8fb;color:#24364b;';
+      });
+      copyButton.addEventListener('click', async (clickEvent) => {
+        clickEvent.stopPropagation();
+        const summary = trigger.__airnavxFsnSummary;
+        if (!summary) {
+          return;
+        }
+        const copied = await copyAircraftFsnSummary(summary, targetDocument);
+        showAircraftFsnCopyResult(targetDocument, copyButton,
+          copied ? 'FSN 汇总已复制' : '复制失败，请检查剪贴板权限');
+      });
+      closeButton.addEventListener('click', () => closeAircraftFsnPopover(popover));
+      actions.appendChild(copyButton);
+      actions.appendChild(closeButton);
+      popover.appendChild(heading);
+      popover.appendChild(content);
+      popover.appendChild(actions);
+      popover.__airnavxContent = content;
+      popover.__airnavxCopyButton = copyButton;
+      updateAircraftFsnPopover(popover, trigger);
+      targetDocument.body.appendChild(popover);
+
+      const rect = trigger.getBoundingClientRect();
+      const viewportWidth = targetDocument.defaultView.innerWidth;
+      popover.style.left = `${Math.max(8, Math.min(rect.left, viewportWidth - 428))}px`;
+      popover.style.top = `${Math.max(8, Math.min(rect.bottom + 6,
+        targetDocument.defaultView.innerHeight - popover.offsetHeight - 8))}px`;
+
+      const outsideDocuments = [targetDocument];
+      let ancestor = targetDocument.defaultView;
+      while (ancestor) {
+        try {
+          const parent = ancestor.parent;
+          if (!parent || parent === ancestor) {
+            break;
+          }
+          if (parent.document) {
+            outsideDocuments.push(parent.document);
+          }
+          ancestor = parent;
+        } catch (error) {
+          break;
+        }
+      }
+      const onOutsideClick = (outsideEvent) => {
+        if (!popover.contains(outsideEvent.target) && !trigger.contains(outsideEvent.target)) {
+          closeAircraftFsnPopover(popover);
+        }
+      };
+      popover.__airnavxOutsideDocuments = outsideDocuments;
+      popover.__airnavxOutsideClick = onOutsideClick;
+      outsideDocuments.forEach((target) => target.addEventListener('click', onOutsideClick, true));
+    });
+  }
+
+  function enhanceAircraftFsnGrid(bodyTable, targetDocument) {
+    const registrationIndex = getColumnIndexByHeader(bodyTable, targetDocument, '机号');
+    if (registrationIndex < 0) {
+      return;
+    }
+
+    const scope = getGridScope(bodyTable, targetDocument);
+    const grid = bodyTable.closest('.datagrid-view') || scope;
+    const hasNativeFsn = Array.from(grid.querySelectorAll('.datagrid-htable .datagrid-cell'))
+      .some((cell) => /^(?:FSN|机队序号)$/i.test(cleanText(cell.textContent)) &&
+        !cell.closest(`td.${AIRCRAFT_FSN_CELL_CLASS}`));
+    if (hasNativeFsn) {
+      return;
+    }
+
+    const headerRows = Array.from(scope.querySelectorAll('.datagrid-htable tr'));
+    const headerRow = headerRows[headerRows.length - 1];
+    if (!headerRow || !headerRow.children[registrationIndex]) {
+      return;
+    }
+    const registrationHeader = headerRow.children[registrationIndex];
+
+    let header = Array.from(headerRow.children)
+      .find((cell) => cell.classList.contains(AIRCRAFT_FSN_CELL_CLASS));
+    if (!header) {
+      header = targetDocument.createElement('td');
+      header.className = AIRCRAFT_FSN_CELL_CLASS;
+      const label = targetDocument.createElement('div');
+      label.className = 'datagrid-cell';
+      label.textContent = 'FSN';
+      header.appendChild(label);
+      headerRow.insertBefore(header, headerRow.children[registrationIndex].nextSibling);
+    }
+    if (!targetDocument.getElementById('airnavx-aircraft-fsn-style')) {
+      const style = targetDocument.createElement('style');
+      style.id = 'airnavx-aircraft-fsn-style';
+      style.textContent = `.${AIRCRAFT_FSN_CELL_CLASS} .datagrid-cell {
+        white-space:nowrap;
+        overflow:hidden;
+        text-overflow:ellipsis;
+        text-align:center;
+      }
+      .${AIRCRAFT_FSN_CELL_CLASS} .airnavx-aircraft-fsn-trigger {
+        border:0;
+        border-bottom:1px dotted currentColor;
+        margin:0;
+        padding:0;
+        background:transparent;
+        color:#0a65a2;
+        cursor:pointer;
+        font:inherit;
+      }`;
+      targetDocument.head.appendChild(style);
+    }
+
+    let hasRegistration = false;
+    let contentWidth = AIRCRAFT_FSN_MIN_WIDTH;
+    bodyTable.querySelectorAll('tbody tr').forEach((row) => {
+      const registrationCell = row.children[registrationIndex];
+      if (!registrationCell) {
+        return;
+      }
+      const registration = normalizeAircraftRegistration(getRowCellText(row, registrationIndex));
+      if (registration) {
+        hasRegistration = true;
+      }
+      let cell = Array.from(row.children)
+        .find((child) => child.classList.contains(AIRCRAFT_FSN_CELL_CLASS));
+      if (!cell) {
+        cell = targetDocument.createElement('td');
+        cell.className = AIRCRAFT_FSN_CELL_CLASS;
+        const content = targetDocument.createElement('div');
+        content.className = 'datagrid-cell';
+        cell.appendChild(content);
+        row.insertBefore(cell, registrationCell.nextSibling);
+      }
+      const record = registration ? aircraftFsns.get(registration) : null;
+      const fsn = record?.fsn || '';
+      const displayText = fsn ? `${fsn}${record.retired ? ' 已退租' : ''}` : '';
+      const content = cell.querySelector('.datagrid-cell');
+      if (content.textContent !== displayText) {
+        content.textContent = displayText;
+      }
+      contentWidth = Math.max(contentWidth, estimateTextWidth(displayText) + 16);
+      cell.title = registration && !fsn && aircraftFsnsLoadedAt
+        ? `飞机主数据中未匹配到 ${registration} 的 FSN` : '';
+    });
+
+    if (hasRegistration) {
+      void loadAircraftFsns();
+    }
+    const allRegistrations = getAircraftGridRegistrations(bodyTable, targetDocument, registrationHeader);
+    const summary = aircraftFsnsLoadedAt && allRegistrations
+      ? getAircraftFsnSummary(allRegistrations) : '';
+    const summaryState = aircraftFsnGridSummaries.get(bodyTable.closest('.datagrid-view') || bodyTable);
+    const headerContent = header.querySelector('.datagrid-cell');
+    let trigger = headerContent.querySelector('button.airnavx-aircraft-fsn-trigger');
+    if (!trigger) {
+      headerContent.textContent = '';
+      trigger = targetDocument.createElement('button');
+      trigger.type = 'button';
+      trigger.className = 'airnavx-aircraft-fsn-trigger';
+      trigger.textContent = 'FSN';
+      trigger.title = '点击查看 FSN 汇总';
+      headerContent.appendChild(trigger);
+    }
+    trigger.__airnavxFsnSummary = summary;
+    trigger.__airnavxFsnStatus = aircraftFsnsLastError
+      ? `飞机主数据暂不可用，将自动重试：${aircraftFsnsLastError}`
+      : aircraftFsnsLoadedAt
+        ? allRegistrations ? '当前结果中没有可汇总的未退租 FSN'
+          : summaryState?.error ? `读取当前表格全部分页失败：${summaryState.error}；稍后重试`
+            : '正在读取当前表格的全部分页'
+        : '正在读取飞机主数据';
+    bindAircraftFsnSummaryButton(trigger, targetDocument);
+    headerContent.title = '';
+    const popover = targetDocument.getElementById(AIRCRAFT_FSN_POPOVER_ID);
+    if (popover?.__airnavxSource === trigger &&
+        (popover.__airnavxSummary !== summary || !summary)) {
+      updateAircraftFsnPopover(popover, trigger);
+    }
+    const width = clamp(Math.max(contentWidth, estimateTextWidth('FSN') + 16),
+      AIRCRAFT_FSN_MIN_WIDTH, AIRCRAFT_FSN_MAX_WIDTH);
+    headerContent.style.width = `${width}px`;
+    headerContent.style.minWidth = `${width}px`;
+    bodyTable.querySelectorAll(`td.${AIRCRAFT_FSN_CELL_CLASS} .datagrid-cell`).forEach((content) => {
+      content.style.width = `${width}px`;
+      content.style.minWidth = `${width}px`;
+    });
+  }
+
   function removeButtons(cell, selector) {
     const contentNode = getCellContentNode(cell);
     if (!contentNode) {
@@ -1604,6 +2078,10 @@
     }
 
     targetDocument.querySelectorAll('table.datagrid-btable').forEach((bodyTable) => {
+      // Each AMES iframe loads this userscript itself. Its own instance alone owns the FSN column.
+      if (targetDocument === document) {
+        enhanceAircraftFsnGrid(bodyTable, targetDocument);
+      }
       enhanceRawMessageGrid(bodyTable, targetDocument);
       enhanceCmpReferenceGrid(bodyTable, targetDocument);
 
