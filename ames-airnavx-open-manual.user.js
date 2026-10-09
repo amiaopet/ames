@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.16.19
+// @version      1.16.21
 // @description  AMES 工卡/工程评估/MEL备注/报文解析增强、AirNavX 手册翻译、Boeing Toolbox 自动继续与本机翻译
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
@@ -1231,7 +1231,7 @@
     return match ? `B-${match[1]}` : '';
   }
 
-  function formatFsnRanges(values) {
+  function formatFsnRanges(values, compactSingles = false) {
     const numbers = Array.from(new Set(values.map(Number).filter(Number.isSafeInteger)))
       .sort((left, right) => left - right);
     const ranges = [];
@@ -1243,14 +1243,43 @@
         ranges.push([value, value]);
       }
     }
-    return ranges.map(([first, last]) => `${first}-${last}`).join(',');
+    return ranges.map(([first, last]) => compactSingles && first === last
+      ? String(first) : `${first}-${last}`).join(',');
   }
 
-  function getAircraftFsnSummary(registrations) {
-    return formatFsnRanges(registrations.map((registration) => {
-      const record = aircraftFsns.get(normalizeAircraftRegistration(registration));
-      return record && !record.retired ? record.fsn : '';
-    }).filter((fsn) => /^\d+$/.test(fsn)));
+  function getAircraftFsnSummaryDetails(registrations) {
+    const seen = new Set();
+    const aircraft = [];
+    const groups = new Map();
+    registrations.forEach((registration) => {
+      const key = normalizeAircraftRegistration(registration);
+      if (!key || seen.has(key)) {
+        return;
+      }
+      seen.add(key);
+      const record = aircraftFsns.get(key);
+      if (!record || record.retired || !/^\d+$/.test(record.fsn)) {
+        return;
+      }
+      aircraft.push(record);
+      const type = record.aircraftType || '构型机型未注明';
+      const engine = record.engineType || '发动机型号未注明';
+      const groupKey = JSON.stringify([type, engine]);
+      if (!groups.has(groupKey)) {
+        groups.set(groupKey, { type, engine, fsns: [] });
+      }
+      groups.get(groupKey).fsns.push(record.fsn);
+    });
+    const summary = formatFsnRanges(aircraft.map((record) => record.fsn));
+    const groupLines = Array.from(groups.values())
+      .sort((left, right) => left.type.localeCompare(right.type) ||
+        left.engine.localeCompare(right.engine))
+      .map(({ type, engine, fsns }) =>
+        `${type} ${engine}（共${fsns.length}架）：FSN ${formatFsnRanges(fsns, true)}`);
+    return {
+      summary,
+      display: summary ? `FSN ${summary}\n共${aircraft.length}架飞机\n\n${groupLines.join('\n')}` : ''
+    };
   }
 
   function getAircraftGridData(bodyTable, targetDocument, registrationHeader) {
@@ -1379,7 +1408,12 @@
             const previous = nextFsns.get(registration);
             nextFsns.set(registration, previous && previous.fsn !== fsn
               ? { fsn: '', retired: false }
-              : { fsn, retired: Boolean(previous?.retired || cleanText(aircraft['实际退出时间'])) });
+              : {
+                fsn,
+                retired: Boolean(previous?.retired || cleanText(aircraft['实际退出时间'])),
+                aircraftType: cleanText(aircraft['构型机型']) || previous?.aircraftType || '',
+                engineType: cleanText(aircraft['ENG型号']) || previous?.engineType || ''
+              });
           }
         });
         totalPages = Math.max(1, Math.ceil(Number(result.data.pagination?.total_pages) || 1));
@@ -1443,7 +1477,7 @@
   function updateAircraftFsnPopover(popover, trigger) {
     const summary = trigger.__airnavxFsnSummary;
     popover.__airnavxSummary = summary;
-    const text = summary || trigger.__airnavxFsnStatus;
+    const text = trigger.__airnavxFsnDisplay || trigger.__airnavxFsnStatus;
     if (popover.__airnavxContent.textContent !== text) {
       popover.__airnavxContent.textContent = text;
     }
@@ -1489,8 +1523,8 @@
       heading.textContent = '未退租飞机 FSN 汇总';
       heading.style.cssText = 'font-weight:bold;margin-bottom:8px;';
       const content = targetDocument.createElement('div');
-      content.style.cssText = 'max-height:240px;overflow:auto;user-select:text;'
-        + 'white-space:normal;overflow-wrap:anywhere;line-height:1.5;';
+      content.style.cssText = 'max-height:320px;overflow:auto;user-select:text;'
+        + 'white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.5;';
       const actions = targetDocument.createElement('div');
       actions.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;margin-top:10px;';
       const copyButton = targetDocument.createElement('button');
@@ -1505,11 +1539,11 @@
       });
       copyButton.addEventListener('click', async (clickEvent) => {
         clickEvent.stopPropagation();
-        const summary = trigger.__airnavxFsnSummary;
-        if (!summary) {
+        if (!trigger.__airnavxFsnSummary) {
           return;
         }
-        const copied = await copyAircraftFsnSummary(summary, targetDocument);
+        const fullSummary = `${heading.textContent}\n${popover.__airnavxContent.textContent}`;
+        const copied = await copyAircraftFsnSummary(fullSummary, targetDocument);
         showAircraftFsnCopyResult(targetDocument, copyButton,
           copied ? 'FSN 汇总已复制' : '复制失败，请检查剪贴板权限');
       });
@@ -1649,8 +1683,9 @@
       void loadAircraftFsns();
     }
     const allRegistrations = getAircraftGridRegistrations(bodyTable, targetDocument, registrationHeader);
-    const summary = aircraftFsnsLoadedAt && allRegistrations
-      ? getAircraftFsnSummary(allRegistrations) : '';
+    const summaryDetails = aircraftFsnsLoadedAt && allRegistrations
+      ? getAircraftFsnSummaryDetails(allRegistrations) : { summary: '', display: '' };
+    const { summary } = summaryDetails;
     const summaryState = aircraftFsnGridSummaries.get(bodyTable.closest('.datagrid-view') || bodyTable);
     const headerContent = header.querySelector('.datagrid-cell');
     let trigger = headerContent.querySelector('button.airnavx-aircraft-fsn-trigger');
@@ -1664,6 +1699,7 @@
       headerContent.appendChild(trigger);
     }
     trigger.__airnavxFsnSummary = summary;
+    trigger.__airnavxFsnDisplay = summaryDetails.display;
     trigger.__airnavxFsnStatus = aircraftFsnsLastError
       ? `飞机主数据暂不可用，将自动重试：${aircraftFsnsLastError}`
       : aircraftFsnsLoadedAt
@@ -1675,7 +1711,8 @@
     headerContent.title = '';
     const popover = targetDocument.getElementById(AIRCRAFT_FSN_POPOVER_ID);
     if (popover?.__airnavxSource === trigger &&
-        (popover.__airnavxSummary !== summary || !summary)) {
+        (popover.__airnavxContent.textContent !==
+          (summaryDetails.display || trigger.__airnavxFsnStatus))) {
       updateAircraftFsnPopover(popover, trigger);
     }
     const width = clamp(Math.max(contentWidth, estimateTextWidth('FSN') + 16),
