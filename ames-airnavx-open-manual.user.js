@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.16.21
+// @version      1.16.24
 // @description  AMES 工卡/工程评估/MEL备注/报文解析增强、AirNavX 手册翻译、Boeing Toolbox 自动继续与本机翻译
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
@@ -34,6 +34,9 @@
   const BUTTON_WRAP_CLASS = 'airnavx-open-manual-wrap';
   const EVAL_PREVIOUS_BUTTON_CLASS = 'airnavx-eval-previous';
   const EVAL_TOOL_BUTTON_CLASS = 'airnavx-eval-tool-button';
+  const EVAL_OPEN_BUTTON_CLASS = 'airnavx-eval-open-record';
+  const EVAL_LIST_PATH = '/views/em/emfileeva/emfileeva_list.shtml';
+  const EVAL_OPEN_REQUEST_ATTRIBUTE = 'data-airnavx-eval-open-request';
   const EVAL_RETURN_STATE_KEY = '__airnavxEngineeringEvalReturnState';
   const EVAL_CURRENT_USER_NAME_KEY = '__airnavxEngineeringEvalCurrentUserName';
   const RAW_MESSAGE_HEADER = '报文内容';
@@ -497,7 +500,7 @@
 
   function getCellPlainText(container) {
     const clone = container.cloneNode(true);
-    clone.querySelectorAll(`.${BUTTON_WRAP_CLASS}, .${BUTTON_CLASS}`).forEach((node) => node.remove());
+    clone.querySelectorAll(`.${BUTTON_WRAP_CLASS}, .${BUTTON_CLASS}, .${EVAL_OPEN_BUTTON_CLASS}`).forEach((node) => node.remove());
     return cleanText(clone.textContent);
   }
 
@@ -1219,6 +1222,7 @@
   }
 
   const aircraftFsns = new Map();
+  const aircraftFsnFleetGroups = new Map();
   let aircraftFsnsLoadedAt = 0;
   let aircraftFsnsLoadPromise = null;
   let aircraftFsnsRetryAfter = 0;
@@ -1266,16 +1270,23 @@
       const engine = record.engineType || '发动机型号未注明';
       const groupKey = JSON.stringify([type, engine]);
       if (!groups.has(groupKey)) {
-        groups.set(groupKey, { type, engine, fsns: [] });
+        groups.set(groupKey, { type, engine, fsns: [], registrations: new Set() });
       }
       groups.get(groupKey).fsns.push(record.fsn);
+      groups.get(groupKey).registrations.add(key);
     });
     const summary = formatFsnRanges(aircraft.map((record) => record.fsn));
     const groupLines = Array.from(groups.values())
       .sort((left, right) => left.type.localeCompare(right.type) ||
         left.engine.localeCompare(right.engine))
-      .map(({ type, engine, fsns }) =>
-        `${type} ${engine}（共${fsns.length}架）：FSN ${formatFsnRanges(fsns, true)}`);
+      .map(({ type, engine, fsns, registrations: groupRegistrations }) => {
+        const fleetRegistrations = aircraftFsnFleetGroups.get(JSON.stringify([type, engine]));
+        const includesAll = fleetRegistrations &&
+          groupRegistrations.size === fleetRegistrations.size &&
+          Array.from(groupRegistrations).every((key) => fleetRegistrations.has(key));
+        return `${type} ${engine}${includesAll ? '（ALL）' : `（共${fsns.length}架）`}`
+          + `：FSN ${formatFsnRanges(fsns, true)}`;
+      });
     return {
       summary,
       display: summary ? `FSN ${summary}\n共${aircraft.length}架飞机\n\n${groupLines.join('\n')}` : ''
@@ -1320,9 +1331,10 @@
     }
 
     const scope = bodyTable.closest('.datagrid-view') || bodyTable;
-    const pageSize = Math.max(1, Number(options.pageSize) || rows.length || 20);
+    // Background reads use their own batch size; never change the grid's page-size setting.
+    const batchSize = Math.min(total, 200);
     const fingerprint = JSON.stringify([options.url, options.method, options.queryParams,
-      options.sortName, options.sortOrder, total, pageSize, field]);
+      options.sortName, options.sortOrder, total, field]);
     const previous = aircraftFsnGridSummaries.get(scope);
     if (previous?.fingerprint === fingerprint && Date.now() - previous.startedAt < 60000) {
       return previous.registrations || null;
@@ -1331,11 +1343,14 @@
     aircraftFsnGridSummaries.set(scope, state);
     const readPages = async () => {
       const allRows = [];
-      const pages = Math.ceil(total / pageSize);
+      const pages = Math.ceil(total / batchSize);
       for (let page = 1; page <= pages; page += 1) {
+        if (aircraftFsnGridSummaries.get(scope) !== state) {
+          return;
+        }
         const params = new URLSearchParams(options.queryParams || {});
         params.set('page', String(page));
-        params.set('rows', String(pageSize));
+        params.set('rows', String(batchSize));
         if (options.sortName) {
           params.set('sort', options.sortName);
           params.set('order', options.sortOrder || 'asc');
@@ -1361,6 +1376,17 @@
         if (Number(result.code) !== 200 || !Array.isArray(pageRows)) {
           throw new Error('分页结果格式不正确');
         }
+        const returnedPage = Number(result.page ?? result.data?.page);
+        const returnedTotal = Number(result.total ?? result.data?.total);
+        if ((Number.isSafeInteger(returnedPage) && returnedPage !== page) ||
+            (Number.isSafeInteger(returnedTotal) && returnedTotal !== total)) {
+          throw new Error(`分页结果与请求不一致：请求第 ${page} 页，返回第 ${returnedPage} 页，` +
+            `总数 ${returnedTotal}/${total}`);
+        }
+        const expectedCount = Math.min(batchSize, total - allRows.length);
+        if (pageRows.length !== expectedCount) {
+          throw new Error(`第 ${page} 页应有 ${expectedCount} 条，实际取得 ${pageRows.length} 条`);
+        }
         allRows.push(...pageRows);
       }
       if (allRows.length < total) {
@@ -1372,8 +1398,11 @@
       }
     };
     void readPages().catch((error) => {
-      state.error = String(error?.message || error);
-      console.warn('读取 AMES 表格全部分页失败', error);
+      if (aircraftFsnGridSummaries.get(scope) === state) {
+        state.error = String(error?.message || error);
+        console.warn('读取 AMES 表格全部分页失败', error);
+        enhanceTables();
+      }
     });
     return null;
   }
@@ -1386,6 +1415,7 @@
 
     aircraftFsnsLoadPromise = (async () => {
       const nextFsns = new Map();
+      const nextFleetGroups = new Map();
       let totalPages = 1;
       for (let page = 1; page <= totalPages; page += 1) {
         const url = new URL('/api/aircraft-master/search', TOOLBOX_BASE);
@@ -1402,6 +1432,16 @@
         }
         result.data.aircraft.forEach((aircraft) => {
           const registration = normalizeAircraftRegistration(aircraft['机号']);
+          const aircraftType = cleanText(aircraft['构型机型']);
+          const engineType = cleanText(aircraft['ENG型号']);
+          const retired = Boolean(cleanText(aircraft['实际退出时间']));
+          if (registration && aircraftType && engineType && !retired) {
+            const groupKey = JSON.stringify([aircraftType, engineType]);
+            if (!nextFleetGroups.has(groupKey)) {
+              nextFleetGroups.set(groupKey, new Set());
+            }
+            nextFleetGroups.get(groupKey).add(registration);
+          }
           const fsn = cleanText(String(aircraft.FSN ?? ''));
           if (registration && /^\d+$/.test(fsn)) {
             // Conflicting master records must not produce an arbitrary FSN.
@@ -1410,9 +1450,9 @@
               ? { fsn: '', retired: false }
               : {
                 fsn,
-                retired: Boolean(previous?.retired || cleanText(aircraft['实际退出时间'])),
-                aircraftType: cleanText(aircraft['构型机型']) || previous?.aircraftType || '',
-                engineType: cleanText(aircraft['ENG型号']) || previous?.engineType || ''
+                retired: Boolean(previous?.retired || retired),
+                aircraftType: aircraftType || previous?.aircraftType || '',
+                engineType: engineType || previous?.engineType || ''
               });
           }
         });
@@ -1420,6 +1460,9 @@
       }
       aircraftFsns.clear();
       nextFsns.forEach((record, registration) => aircraftFsns.set(registration, record));
+      aircraftFsnFleetGroups.clear();
+      nextFleetGroups.forEach((registrations, groupKey) =>
+        aircraftFsnFleetGroups.set(groupKey, registrations));
       aircraftFsnsLoadedAt = Date.now();
       aircraftFsnsLastError = '';
       enhanceTables();
@@ -2149,9 +2192,132 @@
     });
   }
 
+  function findAmesHomeWindow(sourceWindow) {
+    for (const candidate of [sourceWindow, sourceWindow.opener]) {
+      try {
+        const homeWindow = candidate && candidate.top;
+        if (homeWindow && homeWindow.location.pathname === '/views/home.shtml') {
+          return homeWindow;
+        }
+      } catch (error) {
+        // A standalone window may have no accessible opener.
+      }
+    }
+    return null;
+  }
+
+  function openEngineeringEvaluationRecord(targetDocument, fileNo) {
+    const sourceWindow = targetDocument.defaultView || window;
+    const query = cleanText(fileNo);
+    if (!query) {
+      return false;
+    }
+
+    const homeWindow = findAmesHomeWindow(sourceWindow);
+    const menuItem = homeWindow && homeWindow.document.querySelector(`a.J_menuItem[href="${EVAL_LIST_PATH}"]`);
+    if (menuItem) {
+      homeWindow.document.documentElement.setAttribute(EVAL_OPEN_REQUEST_ATTRIBUTE, JSON.stringify({
+        fileNo: query,
+        createdAt: Date.now()
+      }));
+      menuItem.click();
+      homeWindow.focus();
+      return true;
+    }
+
+    const evaluationUrl = new URL(EVAL_LIST_PATH, sourceWindow.location.origin);
+    evaluationUrl.searchParams.set('airnavxEvalFileNo', query);
+    return Boolean(sourceWindow.open(evaluationUrl.href, '_blank'));
+  }
+
+  function buildOpenEvaluationRecordButton(targetDocument, fileNo) {
+    const button = targetDocument.createElement('button');
+    button.type = 'button';
+    button.className = EVAL_OPEN_BUTTON_CLASS;
+    button.textContent = '打开评估记录';
+    button.title = `清空工程文件评估条件并查询 ${fileNo}`;
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      openEngineeringEvaluationRecord(targetDocument, fileNo);
+    });
+    return button;
+  }
+
+  function enhanceEoManagementEvaluationButtons(targetDocument) {
+    if (!targetDocument.defaultView?.location?.pathname?.endsWith('/em/emeo/emeo_add_edit.shtml')) {
+      return;
+    }
+
+    targetDocument.querySelectorAll('table.datagrid-btable').forEach((bodyTable) => {
+      const fileTypeIndex = getColumnIndexByHeader(bodyTable, targetDocument, '文件类型');
+      const fileNoIndex = getColumnIndexByHeader(bodyTable, targetDocument, '文件号');
+      if (fileTypeIndex < 0 || fileNoIndex < 0) {
+        return;
+      }
+
+      bodyTable.querySelectorAll('tbody tr').forEach((row) => {
+        const fileNoCell = row.children[fileNoIndex];
+        const contentNode = getCellContentNode(fileNoCell);
+        if (!contentNode) {
+          return;
+        }
+
+        const fileNo = getRowCellText(row, fileNoIndex);
+        const existingButton = contentNode.querySelector(`.${EVAL_OPEN_BUTTON_CLASS}`);
+        if (getRowCellText(row, fileTypeIndex).toUpperCase() !== 'SB' || !fileNo) {
+          existingButton?.remove();
+          return;
+        }
+
+        if (!existingButton || existingButton.dataset.fileNo !== fileNo) {
+          existingButton?.remove();
+          const button = buildOpenEvaluationRecordButton(targetDocument, fileNo);
+          button.dataset.fileNo = fileNo;
+          contentNode.appendChild(button);
+        }
+      });
+    });
+  }
+
+  function getEoJobcardSbSearchNumber(value) {
+    const normalized = normalizeDash(cleanText(value)).toUpperCase();
+    const match = normalized.match(/(?:^|[^A-Z0-9])(\d{2}-[A-Z0-9]{4})(?=$|[^A-Z0-9])/);
+    return match ? match[1] : '';
+  }
+
+  function enhanceEoJobcardEvaluationButton(targetDocument) {
+    if (!targetDocument.defaultView?.location?.pathname?.endsWith('/td/jobcard/eojc/tdEojcDetail.shtml')) {
+      return;
+    }
+
+    const referenceField = targetDocument.getElementById('ifRefsb');
+    const sbField = targetDocument.getElementById('manualFileNo');
+    const sbCell = sbField && sbField.closest('td');
+    if (!referenceField || !sbCell) {
+      return;
+    }
+
+    const visibleSbNumber = sbCell.querySelector('input.textbox-text')?.value || '';
+    const fileNo = getFieldValue(targetDocument, 'ifRefsb') === 'Y'
+      ? getEoJobcardSbSearchNumber(visibleSbNumber) : '';
+    const existingButton = sbCell.querySelector(`.${EVAL_OPEN_BUTTON_CLASS}`);
+    if (!fileNo) {
+      existingButton?.remove();
+      return;
+    }
+
+    if (!existingButton || existingButton.dataset.fileNo !== fileNo) {
+      existingButton?.remove();
+      const button = buildOpenEvaluationRecordButton(targetDocument, fileNo);
+      button.dataset.fileNo = fileNo;
+      sbCell.appendChild(button);
+    }
+  }
+
   function isEngineeringEvaluationDocument(targetDocument) {
     try {
-      if (targetDocument.defaultView.location.href.includes('/em/emfileeva/emfileeva_list.shtml')) {
+      if (targetDocument.defaultView.location.href.includes(EVAL_LIST_PATH)) {
         return true;
       }
     } catch (error) {
@@ -2341,6 +2507,57 @@
     }, 120);
   }
 
+  function consumeEngineeringEvaluationOpenRequest(targetDocument) {
+    const targetWindow = targetDocument.defaultView || window;
+    if (!targetDocument.getElementById('fileNo') ||
+        !Array.from(targetDocument.querySelectorAll('a, button'))
+          .some((node) => cleanText(node.textContent) === '查询')) {
+      return;
+    }
+
+    let homeDocument = null;
+    try {
+      if (targetWindow.top.location.pathname === '/views/home.shtml') {
+        homeDocument = targetWindow.top.document;
+      }
+    } catch (error) {
+      // A standalone evaluation page can use the URL request below.
+    }
+
+    const requestText = homeDocument?.documentElement.getAttribute(EVAL_OPEN_REQUEST_ATTRIBUTE);
+    let request = null;
+    if (requestText) {
+      try {
+        request = JSON.parse(requestText);
+      } catch (error) {
+        homeDocument.documentElement.removeAttribute(EVAL_OPEN_REQUEST_ATTRIBUTE);
+      }
+    } else {
+      const fileNo = new URL(targetWindow.location.href).searchParams.get('airnavxEvalFileNo');
+      if (fileNo) {
+        request = { fileNo, createdAt: Date.now() };
+      }
+    }
+
+    if (!request) {
+      return;
+    }
+
+    if (!request.fileNo || !Number.isFinite(request.createdAt) ||
+        Date.now() - request.createdAt > 120000) {
+      homeDocument?.documentElement.removeAttribute(EVAL_OPEN_REQUEST_ATTRIBUTE);
+      return;
+    }
+
+    homeDocument?.documentElement.removeAttribute(EVAL_OPEN_REQUEST_ATTRIBUTE);
+    if (targetWindow.location.search.includes('airnavxEvalFileNo=')) {
+      const cleanUrl = new URL(targetWindow.location.href);
+      cleanUrl.searchParams.delete('airnavxEvalFileNo');
+      targetWindow.history.replaceState(targetWindow.history.state, '', cleanUrl.href);
+    }
+    runEngineeringSearch(targetDocument, { fileNo: cleanText(request.fileNo) });
+  }
+
   function buildEngineeringActionButton(targetDocument, text, className) {
     const button = targetDocument.createElement('a');
     button.href = 'javascript:void(0);';
@@ -2458,6 +2675,7 @@
 
     addEngineeringToolbarButtons(targetDocument);
     cacheEngineeringCurrentUserName(targetDocument);
+    consumeEngineeringEvaluationOpenRequest(targetDocument);
     enhanceEngineeringEvaluationRows(targetDocument);
   }
 
@@ -2469,6 +2687,8 @@
       enhanceTablesInDocument(targetDocument);
       enhanceRawMessageDetail(targetDocument);
       enhanceRawMessageViewDetail(targetDocument);
+      enhanceEoManagementEvaluationButtons(targetDocument);
+      enhanceEoJobcardEvaluationButton(targetDocument);
       enhanceEngineeringEvaluation(targetDocument);
     });
   }
@@ -2556,6 +2776,23 @@
         margin-left: 6px;
         padding: 0 6px;
         line-height: 18px;
+      }
+      .${EVAL_OPEN_BUTTON_CLASS} {
+        display: inline-block;
+        margin-left: 8px;
+        padding: 1px 7px;
+        border: 1px solid #2f80ed;
+        border-radius: 3px;
+        background: #2f80ed;
+        color: #fff;
+        font-size: 12px;
+        line-height: 20px;
+        white-space: nowrap;
+        cursor: pointer;
+        vertical-align: middle;
+      }
+      .${EVAL_OPEN_BUTTON_CLASS}:hover {
+        background: #1f6fd1;
       }
       .airnavx-eval-return {
         background: #4f6f9f;
