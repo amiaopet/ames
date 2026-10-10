@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.16.24
+// @version      1.16.26
 // @description  AMES 工卡/工程评估/MEL备注/报文解析增强、AirNavX 手册翻译、Boeing Toolbox 自动继续与本机翻译
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
@@ -35,8 +35,10 @@
   const EVAL_PREVIOUS_BUTTON_CLASS = 'airnavx-eval-previous';
   const EVAL_TOOL_BUTTON_CLASS = 'airnavx-eval-tool-button';
   const EVAL_OPEN_BUTTON_CLASS = 'airnavx-eval-open-record';
+  const EVAL_RECORD_COLUMN_CLASS = 'airnavx-eval-record-column';
   const EVAL_LIST_PATH = '/views/em/emfileeva/emfileeva_list.shtml';
   const EVAL_OPEN_REQUEST_ATTRIBUTE = 'data-airnavx-eval-open-request';
+  const EVAL_FILE_NO_RUN_KEY = '__airnavxEvalFileNoOnlyRun';
   const EVAL_RETURN_STATE_KEY = '__airnavxEngineeringEvalReturnState';
   const EVAL_CURRENT_USER_NAME_KEY = '__airnavxEngineeringEvalCurrentUserName';
   const RAW_MESSAGE_HEADER = '报文内容';
@@ -2244,6 +2246,43 @@
     return button;
   }
 
+  function ensureEoManagementEvaluationColumn(bodyTable, targetDocument, fileNoIndex) {
+    const scope = getGridScope(bodyTable, targetDocument);
+    const headerRows = Array.from(scope.querySelectorAll('.datagrid-htable tr'));
+    const headerRow = headerRows[headerRows.length - 1];
+    if (!headerRow) {
+      return -1;
+    }
+
+    const columnIndex = fileNoIndex + 1;
+    if (headerRow.children[columnIndex]?.querySelector(`.${EVAL_RECORD_COLUMN_CLASS}`)) {
+      return columnIndex;
+    }
+
+    const headerTd = targetDocument.createElement('td');
+    const headerCell = targetDocument.createElement('div');
+    headerCell.className = `datagrid-cell ${EVAL_RECORD_COLUMN_CLASS}`;
+    headerCell.textContent = '评估记录';
+    headerTd.appendChild(headerCell);
+    headerRow.insertBefore(headerTd, headerRow.children[columnIndex] || null);
+    return columnIndex;
+  }
+
+  function ensureEoManagementEvaluationCell(row, targetDocument, fileNoIndex) {
+    const columnIndex = fileNoIndex + 1;
+    const existingCell = row.children[columnIndex];
+    if (existingCell?.querySelector(`.${EVAL_RECORD_COLUMN_CLASS}`)) {
+      return existingCell;
+    }
+
+    const td = targetDocument.createElement('td');
+    const content = targetDocument.createElement('div');
+    content.className = `datagrid-cell ${EVAL_RECORD_COLUMN_CLASS}`;
+    td.appendChild(content);
+    row.insertBefore(td, row.children[columnIndex] || null);
+    return td;
+  }
+
   function enhanceEoManagementEvaluationButtons(targetDocument) {
     if (!targetDocument.defaultView?.location?.pathname?.endsWith('/em/emeo/emeo_add_edit.shtml')) {
       return;
@@ -2256,14 +2295,25 @@
         return;
       }
 
-      bodyTable.querySelectorAll('tbody tr').forEach((row) => {
+      const rows = Array.from(bodyTable.querySelectorAll('tbody tr'));
+      if (!rows.some((row) => getRowCellText(row, fileNoIndex))) {
+        return;
+      }
+
+      if (ensureEoManagementEvaluationColumn(bodyTable, targetDocument, fileNoIndex) < 0) {
+        return;
+      }
+
+      rows.forEach((row) => {
         const fileNoCell = row.children[fileNoIndex];
-        const contentNode = getCellContentNode(fileNoCell);
+        const fileNo = getRowCellText(row, fileNoIndex);
+        fileNoCell?.querySelectorAll(`.${EVAL_OPEN_BUTTON_CLASS}`).forEach((button) => button.remove());
+        const recordCell = ensureEoManagementEvaluationCell(row, targetDocument, fileNoIndex);
+        const contentNode = getCellContentNode(recordCell);
         if (!contentNode) {
           return;
         }
 
-        const fileNo = getRowCellText(row, fileNoIndex);
         const existingButton = contentNode.querySelector(`.${EVAL_OPEN_BUTTON_CLASS}`);
         if (getRowCellText(row, fileTypeIndex).toUpperCase() !== 'SB' || !fileNo) {
           existingButton?.remove();
@@ -2492,6 +2542,7 @@
 
   function runEngineeringSearch(targetDocument, values, options = {}) {
     const targetWindow = targetDocument.defaultView || window;
+    targetWindow[EVAL_FILE_NO_RUN_KEY] = (targetWindow[EVAL_FILE_NO_RUN_KEY] || 0) + 1;
 
     if (options.saveReturnState) {
       targetWindow[EVAL_RETURN_STATE_KEY] = captureEngineeringSearchState(targetDocument);
@@ -2500,11 +2551,111 @@
     clickEngineeringClear(targetDocument);
 
     targetWindow.setTimeout(() => {
-      Object.entries(values).forEach(([fieldId, value]) => {
-        setFieldValue(targetDocument, fieldId, value);
-      });
+      restoreEngineeringSearchState(targetDocument, values);
       targetWindow.setTimeout(() => clickEngineeringSearch(targetDocument), 80);
     }, 120);
+  }
+
+  function runEngineeringFileNoOnlySearch(targetDocument, fileNo) {
+    const targetWindow = targetDocument.defaultView || window;
+    const query = cleanText(fileNo);
+    const runId = (targetWindow[EVAL_FILE_NO_RUN_KEY] || 0) + 1;
+    targetWindow[EVAL_FILE_NO_RUN_KEY] = runId;
+    const startedAt = Date.now();
+    let sawDefaultEvaluator = false;
+
+    function isCurrentRun() {
+      return targetWindow[EVAL_FILE_NO_RUN_KEY] === runId;
+    }
+
+    function hasEvaluatorValue() {
+      const visibleValue = targetDocument.getElementById('evaManName')
+        ?.nextElementSibling?.querySelector('.textbox-text')?.value;
+      return Boolean(cleanText(visibleValue || getFieldValue(targetDocument, 'evaManName')));
+    }
+
+    function isFormReady() {
+      const evaluator = targetDocument.getElementById('evaManName');
+      const fileNumber = targetDocument.getElementById('fileNo');
+      if (!evaluator || !fileNumber) {
+        return false;
+      }
+      return [evaluator, fileNumber].every((field) =>
+        !field.classList.contains('textbox-f') ||
+        Boolean(field.nextElementSibling?.querySelector('.textbox-text')));
+    }
+
+    function searchFileNumber() {
+      if (!isCurrentRun()) {
+        return;
+      }
+      restoreEngineeringSearchState(targetDocument, { fileNo: query });
+      if (typeof targetWindow.onSearchFor === 'function') {
+        targetWindow.onSearchFor(undefined, undefined, (params) => {
+          EVAL_SEARCH_FIELD_IDS.forEach((fieldId) => {
+            params[fieldId] = fieldId === 'fileNo' ? query : '';
+          });
+        });
+      } else {
+        clickEngineeringSearch(targetDocument);
+      }
+
+      const guardUntil = Date.now() + (sawDefaultEvaluator ? 2000 : 8000);
+      const clearLateEvaluator = () => {
+        if (!isCurrentRun() || Date.now() >= guardUntil) {
+          return;
+        }
+        if (hasEvaluatorValue()) {
+          setFieldValue(targetDocument, 'evaManName', '');
+        }
+        targetWindow.setTimeout(clearLateEvaluator, 100);
+      };
+      clearLateEvaluator();
+    }
+
+    function waitForLateDefaults(quietSince) {
+      if (!isCurrentRun()) {
+        return;
+      }
+      if (hasEvaluatorValue()) {
+        sawDefaultEvaluator = true;
+        restoreEngineeringSearchState(targetDocument, { fileNo: query });
+        quietSince = Date.now();
+      }
+      if (Date.now() - quietSince >= 300) {
+        searchFileNumber();
+      } else {
+        targetWindow.setTimeout(() => waitForLateDefaults(quietSince), 100);
+      }
+    }
+
+    function waitForDefaultEvaluator() {
+      if (!isCurrentRun()) {
+        return;
+      }
+      if (!isFormReady()) {
+        if (Date.now() - startedAt < 10000) {
+          targetWindow.setTimeout(waitForDefaultEvaluator, 100);
+        }
+        return;
+      }
+      sawDefaultEvaluator ||= hasEvaluatorValue();
+      if (!sawDefaultEvaluator && Date.now() - startedAt < 2500) {
+        targetWindow.setTimeout(waitForDefaultEvaluator, 100);
+        return;
+      }
+
+      clickEngineeringClear(targetDocument);
+      targetWindow.setTimeout(() => {
+        if (!isCurrentRun()) {
+          return;
+        }
+        restoreEngineeringSearchState(targetDocument, { fileNo: query });
+        waitForLateDefaults(Date.now());
+      }, 120);
+    }
+
+    waitForDefaultEvaluator();
   }
 
   function consumeEngineeringEvaluationOpenRequest(targetDocument) {
@@ -2555,7 +2706,7 @@
       cleanUrl.searchParams.delete('airnavxEvalFileNo');
       targetWindow.history.replaceState(targetWindow.history.state, '', cleanUrl.href);
     }
-    runEngineeringSearch(targetDocument, { fileNo: cleanText(request.fileNo) });
+    runEngineeringFileNoOnlySearch(targetDocument, request.fileNo);
   }
 
   function buildEngineeringActionButton(targetDocument, text, className) {
@@ -2637,6 +2788,7 @@
       event.preventDefault();
       event.stopPropagation();
       const targetWindow = targetDocument.defaultView || window;
+      targetWindow[EVAL_FILE_NO_RUN_KEY] = (targetWindow[EVAL_FILE_NO_RUN_KEY] || 0) + 1;
       const state = targetWindow[EVAL_RETURN_STATE_KEY];
       if (!state) {
         targetWindow.alert('没有可返回的查询状态');
@@ -2793,6 +2945,14 @@
       }
       .${EVAL_OPEN_BUTTON_CLASS}:hover {
         background: #1f6fd1;
+      }
+      .${EVAL_RECORD_COLUMN_CLASS} {
+        width: 116px !important;
+        min-width: 116px !important;
+        text-align: center;
+      }
+      .${EVAL_RECORD_COLUMN_CLASS} .${EVAL_OPEN_BUTTON_CLASS} {
+        margin-left: 0;
       }
       .airnavx-eval-return {
         background: #4f6f9f;
