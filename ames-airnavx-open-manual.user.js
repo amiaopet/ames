@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.16.28
+// @version      1.17.0
 // @description  AMES 工卡/工程评估/MEL备注/报文解析增强、AirNavX 手册翻译、Boeing Toolbox 自动继续与本机翻译
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
@@ -1232,9 +1232,12 @@
   const aircraftFsnGridSummaries = new WeakMap();
   const AIRCRAFT_FSN_MAX_AUTOMATIC_PAGE_REQUESTS = 20;
   const AIRCRAFT_FSN_MAX_MASTER_PAGES = 20;
+  const AIRCRAFT_FSN_MAX_TOTAL_REQUESTS = 20;
+  const AIRCRAFT_FSN_MIN_REQUEST_SPACING_MS = 300;
 
   function getAircraftFsnRequestGuard(targetDocument) {
-    const targetWindow = targetDocument.defaultView || window;
+    const targetWindow = targetDocument === document && typeof unsafeWindow !== 'undefined'
+      ? unsafeWindow : targetDocument.defaultView || window;
     let guardWindow = targetWindow;
     try {
       if (targetWindow.top?.location.origin === targetWindow.location.origin) {
@@ -1245,7 +1248,8 @@
     }
     const key = '__airnavxAircraftFsnRequestGuard';
     if (!guardWindow[key]?.summaries?.get || !guardWindow[key]?.summaries?.set) {
-      guardWindow[key] = { summaries: new Map(), requests: 0, masterRequests: 0 };
+      guardWindow[key] = { summaries: new Map(), requests: 0, masterRequests: 0,
+        automaticRequests: 0 };
     }
     if (!Number.isFinite(guardWindow[key].requests)) {
       guardWindow[key].requests = 0;
@@ -1253,7 +1257,32 @@
     if (!Number.isFinite(guardWindow[key].masterRequests)) {
       guardWindow[key].masterRequests = 0;
     }
+    if (!Number.isFinite(guardWindow[key].automaticRequests)) {
+      guardWindow[key].automaticRequests = 0;
+    }
+    if (!Number.isFinite(guardWindow[key].nextRequestAt)) {
+      guardWindow[key].nextRequestAt = 0;
+    }
     return guardWindow[key];
+  }
+
+  async function waitForAircraftFsnReadSlot(guard, requestWindow) {
+    const previousSlot = guard.lastRequestSlot;
+    let releaseSlot;
+    guard.lastRequestSlot = new Promise((resolve) => { releaseSlot = resolve; });
+    try {
+      if (previousSlot) {
+        await previousSlot;
+      }
+      let remaining = guard.nextRequestAt - Date.now();
+      while (remaining > 0) {
+        await new Promise((resolve) => requestWindow.setTimeout(resolve, remaining));
+        remaining = guard.nextRequestAt - Date.now();
+      }
+      guard.nextRequestAt = Date.now() + AIRCRAFT_FSN_MIN_REQUEST_SPACING_MS;
+    } finally {
+      releaseSlot();
+    }
   }
 
   function normalizeAircraftRegistration(value) {
@@ -1363,8 +1392,22 @@
     const filterParams = new URLSearchParams(queryParams);
     ['page', 'rows', 'sort', 'order'].forEach((key) => filterParams.delete(key));
     filterParams.sort();
-    const fingerprint = JSON.stringify([options.url, options.method, filterParams.toString(),
-      options.sortName, options.sortOrder, total, field]);
+    const gridUrl = options.url;
+    const method = String(options.method || 'post').toUpperCase();
+    let resolvedGridUrl;
+    try {
+      resolvedGridUrl = new URL(gridUrl, targetDocument.location.href);
+    } catch (error) {
+      return null;
+    }
+    if ((method !== 'GET' && method !== 'POST') ||
+        resolvedGridUrl.origin !== new URL(targetDocument.location.href).origin) {
+      return null;
+    }
+    const sortName = options.sortName || '';
+    const sortOrder = options.sortOrder || 'asc';
+    const fingerprint = JSON.stringify([new URL(targetDocument.location.href).pathname,
+      gridUrl, method, filterParams.toString(), sortName, sortOrder, total, field]);
     const guard = getAircraftFsnRequestGuard(targetDocument);
     const previous = guard.summaries.get(fingerprint);
     if (previous) {
@@ -1372,7 +1415,8 @@
       return previous.registrations || null;
     }
     const pages = Math.ceil(total / batchSize);
-    if (pages > AIRCRAFT_FSN_MAX_AUTOMATIC_PAGE_REQUESTS - guard.requests) {
+    if (pages > Math.min(AIRCRAFT_FSN_MAX_AUTOMATIC_PAGE_REQUESTS - guard.requests,
+      AIRCRAFT_FSN_MAX_TOTAL_REQUESTS - guard.automaticRequests)) {
       aircraftFsnGridSummaries.set(source, {
         fingerprint, registrations: null,
         error: `本页自动分页请求已达上限（${AIRCRAFT_FSN_MAX_AUTOMATIC_PAGE_REQUESTS} 次），请缩小查询范围或重新打开页面`
@@ -1389,19 +1433,25 @@
           state.error = '查询条件已变化，已停止读取旧结果';
           return;
         }
-        if (guard.requests >= AIRCRAFT_FSN_MAX_AUTOMATIC_PAGE_REQUESTS) {
+        if (guard.requests >= AIRCRAFT_FSN_MAX_AUTOMATIC_PAGE_REQUESTS ||
+            guard.automaticRequests >= AIRCRAFT_FSN_MAX_TOTAL_REQUESTS) {
           throw new Error('本页自动分页请求已达上限');
         }
         guard.requests += 1;
+        guard.automaticRequests += 1;
+        await waitForAircraftFsnReadSlot(guard, pageWindow);
+        if (aircraftFsnGridSummaries.get(source) !== state) {
+          state.error = '查询条件已变化，已停止读取旧结果';
+          return;
+        }
         const params = new URLSearchParams(queryParams);
         params.set('page', String(page));
         params.set('rows', String(batchSize));
-        if (options.sortName) {
-          params.set('sort', options.sortName);
-          params.set('order', options.sortOrder || 'asc');
+        if (sortName) {
+          params.set('sort', sortName);
+          params.set('order', sortOrder);
         }
-        const method = String(options.method || 'post').toUpperCase();
-        const url = new URL(options.url, targetDocument.location.href);
+        const url = new URL(resolvedGridUrl.href);
         if (method === 'GET') {
           params.forEach((value, key) => url.searchParams.set(key, value));
         }
@@ -1411,6 +1461,7 @@
         const timeoutId = controller ? pageWindow.setTimeout?.(() => controller.abort(), 15000)
           : undefined;
         let response;
+        let result;
         try {
           response = await pageWindow.fetch(url.href, {
             method,
@@ -1421,15 +1472,15 @@
               body: params.toString()
             })
           });
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+          result = await response.json();
         } finally {
           if (timeoutId != null) {
             pageWindow.clearTimeout?.(timeoutId);
           }
         }
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-        const result = await response.json();
         const pageRows = Array.isArray(result.data) ? result.data : result.data?.DG_ROWS;
         if (Number(result.code) !== 200 || !Array.isArray(pageRows)) {
           throw new Error('分页结果格式不正确');
@@ -1477,10 +1528,13 @@
       const nextFleetGroups = new Map();
       let totalPages = 1;
       for (let page = 1; page <= totalPages; page += 1) {
-        if (guard.masterRequests >= AIRCRAFT_FSN_MAX_MASTER_PAGES) {
+        if (guard.masterRequests >= AIRCRAFT_FSN_MAX_MASTER_PAGES ||
+            guard.automaticRequests >= AIRCRAFT_FSN_MAX_TOTAL_REQUESTS) {
           throw new Error('本页飞机主数据请求已达上限，已停止自动读取');
         }
         guard.masterRequests += 1;
+        guard.automaticRequests += 1;
+        await waitForAircraftFsnReadSlot(guard, document.defaultView || window);
         const url = new URL('/api/aircraft-master/search', TOOLBOX_BASE);
         url.searchParams.set('show_retired', 'true');
         url.searchParams.set('page_size', '1000');
