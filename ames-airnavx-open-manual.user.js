@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.16.26
+// @version      1.16.27
 // @description  AMES 工卡/工程评估/MEL备注/报文解析增强、AirNavX 手册翻译、Boeing Toolbox 自动继续与本机翻译
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
@@ -1311,7 +1311,7 @@
       if (!field || !Array.isArray(data?.rows)) {
         return null;
       }
-      return { options, data, field, pageWindow };
+      return { source, options, data, field, pageWindow };
     } catch (error) {
       return null;
     }
@@ -1322,7 +1322,7 @@
     if (!gridData) {
       return null;
     }
-    const { options, data, field, pageWindow } = gridData;
+    const { source, options, data, field, pageWindow } = gridData;
     const rows = data.rows;
     const total = Number(data.total);
     if (Number.isSafeInteger(total) && rows.length >= total) {
@@ -1332,25 +1332,28 @@
       return null;
     }
 
-    const scope = bodyTable.closest('.datagrid-view') || bodyTable;
     // Background reads use their own batch size; never change the grid's page-size setting.
     const batchSize = Math.min(total, 200);
-    const fingerprint = JSON.stringify([options.url, options.method, options.queryParams,
+    const queryParams = new URLSearchParams(options.queryParams || {});
+    const filterParams = new URLSearchParams(queryParams);
+    ['page', 'rows', 'sort', 'order'].forEach((key) => filterParams.delete(key));
+    filterParams.sort();
+    const fingerprint = JSON.stringify([options.url, options.method, filterParams.toString(),
       options.sortName, options.sortOrder, total, field]);
-    const previous = aircraftFsnGridSummaries.get(scope);
-    if (previous?.fingerprint === fingerprint && Date.now() - previous.startedAt < 60000) {
+    const previous = aircraftFsnGridSummaries.get(source);
+    if (previous?.fingerprint === fingerprint) {
       return previous.registrations || null;
     }
-    const state = { fingerprint, startedAt: Date.now(), registrations: null };
-    aircraftFsnGridSummaries.set(scope, state);
+    const state = { fingerprint, registrations: null };
+    aircraftFsnGridSummaries.set(source, state);
     const readPages = async () => {
       const allRows = [];
       const pages = Math.ceil(total / batchSize);
       for (let page = 1; page <= pages; page += 1) {
-        if (aircraftFsnGridSummaries.get(scope) !== state) {
+        if (aircraftFsnGridSummaries.get(source) !== state) {
           return;
         }
-        const params = new URLSearchParams(options.queryParams || {});
+        const params = new URLSearchParams(queryParams);
         params.set('page', String(page));
         params.set('rows', String(batchSize));
         if (options.sortName) {
@@ -1394,13 +1397,13 @@
       if (allRows.length < total) {
         throw new Error(`只取得 ${allRows.length}/${total} 条记录`);
       }
-      if (aircraftFsnGridSummaries.get(scope) === state) {
+      if (aircraftFsnGridSummaries.get(source) === state) {
         state.registrations = allRows.map((row) => row?.[field]);
         enhanceTables();
       }
     };
     void readPages().catch((error) => {
-      if (aircraftFsnGridSummaries.get(scope) === state) {
+      if (aircraftFsnGridSummaries.get(source) === state) {
         state.error = String(error?.message || error);
         console.warn('读取 AMES 表格全部分页失败', error);
         enhanceTables();
@@ -1410,8 +1413,7 @@
   }
 
   async function loadAircraftFsns() {
-    if (aircraftFsnsLoadPromise || Date.now() < aircraftFsnsRetryAfter ||
-        (aircraftFsnsLoadedAt && Date.now() - aircraftFsnsLoadedAt < 10 * 60 * 1000)) {
+    if (aircraftFsnsLoadPromise || Date.now() < aircraftFsnsRetryAfter || aircraftFsnsLoadedAt) {
       return;
     }
 
@@ -1731,7 +1733,8 @@
     const summaryDetails = aircraftFsnsLoadedAt && allRegistrations
       ? getAircraftFsnSummaryDetails(allRegistrations) : { summary: '', display: '' };
     const { summary } = summaryDetails;
-    const summaryState = aircraftFsnGridSummaries.get(bodyTable.closest('.datagrid-view') || bodyTable);
+    const summarySource = bodyTable.closest('.datagrid-wrap')?.querySelector('table.datagrid-f');
+    const summaryState = summarySource && aircraftFsnGridSummaries.get(summarySource);
     const headerContent = header.querySelector('.datagrid-cell');
     let trigger = headerContent.querySelector('button.airnavx-aircraft-fsn-trigger');
     if (!trigger) {
@@ -1749,7 +1752,7 @@
       ? `飞机主数据暂不可用，将自动重试：${aircraftFsnsLastError}`
       : aircraftFsnsLoadedAt
         ? allRegistrations ? '当前结果中没有可汇总的未退租 FSN'
-          : summaryState?.error ? `读取当前表格全部分页失败：${summaryState.error}；稍后重试`
+          : summaryState?.error ? `读取当前表格全部分页失败：${summaryState.error}；请重新查询后重试`
             : '正在读取当前表格的全部分页'
         : '正在读取飞机主数据';
     bindAircraftFsnSummaryButton(trigger, targetDocument);
