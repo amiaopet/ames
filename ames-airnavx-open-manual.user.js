@@ -1,20 +1,22 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.17.0
+// @version      1.19.0
 // @description  AMES 工卡/工程评估/MEL备注/报文解析增强、AirNavX 手册翻译、Boeing Toolbox 自动继续与本机翻译
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
 // @match        https://ames.juneyaoair.com/mnt/ftp/tdms/manual/*
 // @match        http://172.29.92.15:8080/*
+// @match        https://mashihang.moonpet.cc/*
 // @match        https://airnavx.juneyaoair.com/airnavx*
 // @match        http://airnav.juneyaoair.com:8000/*
 // @match        http://boeingtoolbox.juneyaoair.com:8080/toolboxremote.html*
 // @match        https://boeingtoolbox.juneyaoair.com/*
-// @updateURL    https://raw.githubusercontent.com/amiaopet/ames/main/ames-airnavx-open-manual.user.js
-// @downloadURL  https://raw.githubusercontent.com/amiaopet/ames/main/ames-airnavx-open-manual.user.js
+// @updateURL    https://mashihang.moonpet.cc/api/userscript-control/ames-airnavx-open-manual.meta.js?endpoint=public
+// @downloadURL  https://mashihang.moonpet.cc/api/userscript-control/ames-airnavx-open-manual.user.js?endpoint=public
 // @grant        unsafeWindow
 // @grant        GM_xmlhttpRequest
+// @grant        GM_info
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_deleteValue
@@ -24,6 +26,7 @@
 // @grant        GM_registerMenuCommand
 // @connect      ames.juneyaoair.com
 // @connect      172.29.92.15
+// @connect      mashihang.moonpet.cc
 // @run-at       document-start
 // ==/UserScript==
 
@@ -63,6 +66,108 @@
   const SEARCH_BASE = 'https://airnavx.juneyaoair.com/airnavx/search/text?q=';
   const TOOLBOX_BASE = 'http://172.29.92.15:8080';
   const TOOLBOX_HOST = '172.29.92.15:8080';
+  const CONTROL_PATH = '/api/userscript-control/ames-airnavx-open-manual';
+  const CONTROL_ENDPOINTS = [
+    { name: 'lan', origin: TOOLBOX_BASE },
+    { name: 'public', origin: 'https://mashihang.moonpet.cc' }
+  ];
+  const CONTROL_VERSION = typeof GM_info !== 'undefined' && GM_info.script
+    ? GM_info.script.version : '1.19.0';
+  const CONTROL_FLAGS_KEY = 'xiaoma-ames-airnav-control-flags';
+  const CONTROL_LAST_CHECK_KEY = 'xiaoma-ames-airnav-control-last-check';
+  const CONTROL_UPDATE_ID_KEY = 'xiaoma-ames-airnav-control-update-id';
+  const CONTROL_PREFERRED_KEY = 'xiaoma-ames-airnav-control-preferred-endpoint';
+  const CONTROL_INTERVAL_MS = 15 * 60 * 1000;
+  const savedRemoteFlags = typeof GM_getValue === 'function' ? GM_getValue(CONTROL_FLAGS_KEY, {}) : {};
+  const remoteFlags = savedRemoteFlags && typeof savedRemoteFlags === 'object' ? savedRemoteFlags : {};
+
+  function featureEnabled(key) {
+    return remoteFlags.enabled !== false && remoteFlags[key] !== false;
+  }
+
+  function versionParts(value) {
+    return String(value || '').split('.').map((part) => Number(part) || 0);
+  }
+
+  function newerVersion(candidate, current) {
+    const left = versionParts(candidate);
+    const right = versionParts(current);
+    for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+      if ((left[index] || 0) !== (right[index] || 0)) {
+        return (left[index] || 0) > (right[index] || 0);
+      }
+    }
+    return false;
+  }
+
+  function readRemoteConfig() {
+    if (typeof GM_getValue !== 'function' || typeof GM_setValue !== 'function' ||
+        typeof GM_xmlhttpRequest !== 'function') return;
+    const now = Date.now();
+    const lastCheck = Number(GM_getValue(CONTROL_LAST_CHECK_KEY, 0)) || 0;
+    if (lastCheck <= now && now - lastCheck < CONTROL_INTERVAL_MS) {
+      return;
+    }
+    GM_setValue(CONTROL_LAST_CHECK_KEY, now);
+    const preferredOrigin = CONTROL_ENDPOINTS.find((entry) => entry.origin === location.origin)?.name;
+    const savedPreferred = GM_getValue(CONTROL_PREFERRED_KEY, 'lan');
+    const preferredName = preferredOrigin || savedPreferred;
+    const endpoints = [...CONTROL_ENDPOINTS].sort((left, right) =>
+      Number(right.name === preferredName) - Number(left.name === preferredName));
+
+    function attempt(index) {
+      if (index >= endpoints.length) return;
+      const endpoint = endpoints[index];
+      let settled = false;
+      const fallback = () => {
+        if (settled) return;
+        settled = true;
+        if (index + 1 < endpoints.length) window.setTimeout(() => attempt(index + 1), 3000);
+      };
+      try {
+        GM_xmlhttpRequest({
+          method: 'GET',
+          url: `${endpoint.origin}${CONTROL_PATH}/config?version=${encodeURIComponent(CONTROL_VERSION)}&endpoint=${endpoint.name}`,
+          timeout: 10000,
+          onload(response) {
+            if (settled) return;
+            let config;
+            try { config = JSON.parse(response.responseText || '{}'); } catch (_) { fallback(); return; }
+            if (response.status !== 200 || config.script_id !== 'ames-airnavx-open-manual' ||
+                !config.flags || typeof config.flags !== 'object') { fallback(); return; }
+            settled = true;
+            GM_setValue(CONTROL_PREFERRED_KEY, endpoint.name);
+            const flags = {};
+            Object.entries(config.flags).forEach(([key, value]) => {
+              if (typeof value === 'boolean') flags[key] = value;
+            });
+            GM_setValue(CONTROL_FLAGS_KEY, flags);
+            const requestId = Number(config.update_request_id) || 0;
+            const handledId = Number(GM_getValue(CONTROL_UPDATE_ID_KEY, 0)) || 0;
+            const expectedUpdateUrl = `${endpoint.origin}${CONTROL_PATH}.user.js?endpoint=${endpoint.name}`;
+            if (requestId > handledId && newerVersion(config.latest_version, CONTROL_VERSION) &&
+                config.update_url === expectedUpdateUrl) {
+              GM_setValue(CONTROL_UPDATE_ID_KEY, requestId);
+              GM_openInTab(config.update_url, { active: true, insert: true });
+            }
+          },
+          onerror: fallback,
+          ontimeout: fallback
+        });
+      } catch (_) {
+        fallback();
+      }
+    }
+    attempt(0);
+  }
+
+  // AMES iframes run their own script instance; only the top page reads control.
+  if (window === window.top && typeof window.setTimeout === 'function') {
+    window.setTimeout(readRemoteConfig, 3000 + Math.floor(Math.random() * 27000));
+  }
+  if (window === window.top && typeof window.setInterval === 'function') {
+    window.setInterval(readRemoteConfig, CONTROL_INTERVAL_MS);
+  }
   const MEL_REMARKS_API_BASE = `${TOOLBOX_BASE}/api/mel-remarks`;
   const MEL_REMARK_BOX_ID = 'xiaoma-mel-remark-box';
   const REFERENCE_HEADERS = ['参考资料', '参考手册'];
@@ -421,7 +526,7 @@
     location.pathname === '/raw-message-parser' &&
     new URL(window.location.href).searchParams.has('rawMessageImport');
 
-  if (installToolboxAmesBridge() && !isRawMessageImportPage) {
+  if (featureEnabled('ames_bridge') && installToolboxAmesBridge() && !isRawMessageImportPage) {
     return;
   }
 
@@ -2279,19 +2384,20 @@
 
     targetDocument.querySelectorAll('table.datagrid-btable').forEach((bodyTable) => {
       // Each AMES iframe loads this userscript itself. Its own instance alone owns the FSN column.
-      if (targetDocument === document) {
+      if (featureEnabled('ames_fsn') && targetDocument === document) {
         enhanceAircraftFsnGrid(bodyTable, targetDocument);
       }
-      enhanceRawMessageGrid(bodyTable, targetDocument);
-      enhanceCmpReferenceGrid(bodyTable, targetDocument);
+      if (featureEnabled('ames_raw_message')) enhanceRawMessageGrid(bodyTable, targetDocument);
+      if (featureEnabled('ames_cmp_reference')) enhanceCmpReferenceGrid(bodyTable, targetDocument);
 
       if (!looksLikeJobCardGrid(bodyTable, targetDocument)) {
-        if (isSmjcApprovalGrid(bodyTable, targetDocument)) {
+        if (featureEnabled('ames_smjc_reference') && isSmjcApprovalGrid(bodyTable, targetDocument)) {
           void enhanceSmjcApprovalGrid(bodyTable, targetDocument);
         }
         return;
       }
 
+      if (!featureEnabled('ames_manual_links')) return;
       const referenceColumnIndex = getReferenceColumnIndex(bodyTable, targetDocument);
       const fleetColumnIndex = getFleetColumnIndex(bodyTable, targetDocument);
       if (referenceColumnIndex < 0 || fleetColumnIndex < 0) {
@@ -2952,14 +3058,20 @@
   function enhanceTables() {
     getCandidateDocuments().forEach((targetDocument) => {
       installStyle(targetDocument);
-      installAmesToolboxCloseListener(targetDocument);
-      enhanceAmesToolbox(targetDocument);
+      if (featureEnabled('ames_toolbox')) {
+        installAmesToolboxCloseListener(targetDocument);
+        enhanceAmesToolbox(targetDocument);
+      }
       enhanceTablesInDocument(targetDocument);
-      enhanceRawMessageDetail(targetDocument);
-      enhanceRawMessageViewDetail(targetDocument);
-      enhanceEoManagementEvaluationButtons(targetDocument);
-      enhanceEoJobcardEvaluationButton(targetDocument);
-      enhanceEngineeringEvaluation(targetDocument);
+      if (featureEnabled('ames_raw_message')) {
+        enhanceRawMessageDetail(targetDocument);
+        enhanceRawMessageViewDetail(targetDocument);
+      }
+      if (featureEnabled('ames_eo_evaluation')) {
+        enhanceEoManagementEvaluationButtons(targetDocument);
+        enhanceEoJobcardEvaluationButton(targetDocument);
+      }
+      if (featureEnabled('ames_engineering_evaluation')) enhanceEngineeringEvaluation(targetDocument);
     });
   }
 
@@ -3325,7 +3437,6 @@
   }
 
   function startAmesEnhancements() {
-    installRawMessageInitialQueryGuard();
     enhanceTables();
 
     const scheduleEnhance = debounce(enhanceTables, 250);
@@ -4988,30 +5099,36 @@
       window.addEventListener('pagehide', restoreOriginal);
     }
 
-    patchDomEvents();
-    patchHistory();
-    patchNetwork();
-    waitForAngular();
-    registerAccessCodeAutoLoginMenu();
-    runWhenDomReady(startAccessCodeAutoFill);
-    runWhenDomReady(startDocumentTranslation);
+    if (featureEnabled('airnav_pn_format')) {
+      patchDomEvents();
+      patchHistory();
+      patchNetwork();
+      waitForAngular();
+    }
+    if (featureEnabled('airnav_access_code')) {
+      registerAccessCodeAutoLoginMenu();
+      runWhenDomReady(startAccessCodeAutoFill);
+    }
+    if (featureEnabled('airnav_translation')) runWhenDomReady(startDocumentTranslation);
   }
 
-  if (location.host === TOOLBOX_HOST && location.pathname === '/raw-message-parser') {
+  if (featureEnabled('raw_message_import') && location.host === TOOLBOX_HOST && location.pathname === '/raw-message-parser') {
     runRawMessageParserImportRelay();
   } else if (location.hostname === 'ames.juneyaoair.com') {
     if (isMelManualPage()) {
-      runWhenDomReady(startMelRemarkInjection);
+      if (featureEnabled('ames_mel_remarks')) runWhenDomReady(startMelRemarkInjection);
     } else {
-      startRawMessageInitialQueryGuard();
-      runWhenDomReady(startAmesEnhancements);
+      if (featureEnabled('ames_raw_query_guard')) startRawMessageInitialQueryGuard();
+      if (featureEnabled('enabled')) runWhenDomReady(startAmesEnhancements);
     }
   } else if (location.hostname === 'boeingtoolbox.juneyaoair.com' && location.protocol === 'https:') {
-    runBoeingToolboxTranslatorHelper();
+    if (featureEnabled('boeing_translation')) runBoeingToolboxTranslatorHelper();
   } else if (location.hostname === 'boeingtoolbox.juneyaoair.com') {
-    runBoeingToolboxAutoContinue();
-    startBoeingToolboxTranslation();
+    if (featureEnabled('boeing_auto_continue')) runBoeingToolboxAutoContinue();
+    if (featureEnabled('boeing_translation')) startBoeingToolboxTranslation();
   } else if (location.hostname === 'airnavx.juneyaoair.com' || location.host === 'airnav.juneyaoair.com:8000') {
-    runAirNavEnhancements();
+    if (featureEnabled('airnav_pn_format') || featureEnabled('airnav_access_code') || featureEnabled('airnav_translation')) {
+      runAirNavEnhancements();
+    }
   }
 })();
