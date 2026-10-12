@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Juneyao AMES AirNav Toolbox Enhancer
 // @namespace    https://juneyaoair.com/
-// @version      1.19.0
+// @version      2.0.0
 // @description  AMES 工卡/工程评估/MEL备注/报文解析增强、AirNavX 手册翻译、Boeing Toolbox 自动继续与本机翻译
 // @author       Codex
 // @match        https://ames.juneyaoair.com/views/*
@@ -72,14 +72,23 @@
     { name: 'public', origin: 'https://mashihang.moonpet.cc' }
   ];
   const CONTROL_VERSION = typeof GM_info !== 'undefined' && GM_info.script
-    ? GM_info.script.version : '1.19.0';
+    ? GM_info.script.version : '2.0.0';
   const CONTROL_FLAGS_KEY = 'xiaoma-ames-airnav-control-flags';
-  const CONTROL_LAST_CHECK_KEY = 'xiaoma-ames-airnav-control-last-check';
   const CONTROL_UPDATE_ID_KEY = 'xiaoma-ames-airnav-control-update-id';
   const CONTROL_PREFERRED_KEY = 'xiaoma-ames-airnav-control-preferred-endpoint';
-  const CONTROL_INTERVAL_MS = 15 * 60 * 1000;
+  const CONTROL_STARTED_KEY = 'xiaoma-ames-airnav-control-page-started';
+  const CONTROL_READY_KEY = 'xiaoma-ames-airnav-control-page-ready';
   const savedRemoteFlags = typeof GM_getValue === 'function' ? GM_getValue(CONTROL_FLAGS_KEY, {}) : {};
   const remoteFlags = savedRemoteFlags && typeof savedRemoteFlags === 'object' ? savedRemoteFlags : {};
+  const controlPageToken = window === window.top && typeof GM_setValue === 'function'
+    ? `${Date.now()}-${Math.random()}` : '';
+  if (controlPageToken) GM_setValue(CONTROL_STARTED_KEY, controlPageToken);
+
+  function applyRemoteFlags(flags) {
+    const nextFlags = flags && typeof flags === 'object' ? { ...flags } : {};
+    Object.keys(remoteFlags).forEach((key) => delete remoteFlags[key]);
+    Object.assign(remoteFlags, nextFlags);
+  }
 
   function featureEnabled(key) {
     return remoteFlags.enabled !== false && remoteFlags[key] !== false;
@@ -100,29 +109,34 @@
     return false;
   }
 
-  function readRemoteConfig() {
+  function readRemoteConfig(ready) {
+    let completed = false;
+    const finish = () => {
+      if (completed) return;
+      completed = true;
+      if (controlPageToken) GM_setValue(CONTROL_READY_KEY, controlPageToken);
+      ready();
+    };
     if (typeof GM_getValue !== 'function' || typeof GM_setValue !== 'function' ||
-        typeof GM_xmlhttpRequest !== 'function') return;
-    const now = Date.now();
-    const lastCheck = Number(GM_getValue(CONTROL_LAST_CHECK_KEY, 0)) || 0;
-    if (lastCheck <= now && now - lastCheck < CONTROL_INTERVAL_MS) {
+        typeof GM_xmlhttpRequest !== 'function') {
+      finish();
       return;
     }
-    GM_setValue(CONTROL_LAST_CHECK_KEY, now);
     const preferredOrigin = CONTROL_ENDPOINTS.find((entry) => entry.origin === location.origin)?.name;
-    const savedPreferred = GM_getValue(CONTROL_PREFERRED_KEY, 'lan');
+    const savedPreferred = GM_getValue(CONTROL_PREFERRED_KEY, 'public');
     const preferredName = preferredOrigin || savedPreferred;
     const endpoints = [...CONTROL_ENDPOINTS].sort((left, right) =>
       Number(right.name === preferredName) - Number(left.name === preferredName));
 
     function attempt(index) {
-      if (index >= endpoints.length) return;
+      if (index >= endpoints.length) { finish(); return; }
       const endpoint = endpoints[index];
       let settled = false;
       const fallback = () => {
         if (settled) return;
         settled = true;
         if (index + 1 < endpoints.length) window.setTimeout(() => attempt(index + 1), 3000);
+        else finish();
       };
       try {
         GM_xmlhttpRequest({
@@ -142,9 +156,11 @@
               if (typeof value === 'boolean') flags[key] = value;
             });
             GM_setValue(CONTROL_FLAGS_KEY, flags);
+            applyRemoteFlags(flags);
             const requestId = Number(config.update_request_id) || 0;
             const handledId = Number(GM_getValue(CONTROL_UPDATE_ID_KEY, 0)) || 0;
             const expectedUpdateUrl = `${endpoint.origin}${CONTROL_PATH}.user.js?endpoint=${endpoint.name}`;
+            finish();
             if (requestId > handledId && newerVersion(config.latest_version, CONTROL_VERSION) &&
                 config.update_url === expectedUpdateUrl) {
               GM_setValue(CONTROL_UPDATE_ID_KEY, requestId);
@@ -159,14 +175,6 @@
       }
     }
     attempt(0);
-  }
-
-  // AMES iframes run their own script instance; only the top page reads control.
-  if (window === window.top && typeof window.setTimeout === 'function') {
-    window.setTimeout(readRemoteConfig, 3000 + Math.floor(Math.random() * 27000));
-  }
-  if (window === window.top && typeof window.setInterval === 'function') {
-    window.setInterval(readRemoteConfig, CONTROL_INTERVAL_MS);
   }
   const MEL_REMARKS_API_BASE = `${TOOLBOX_BASE}/api/mel-remarks`;
   const MEL_REMARK_BOX_ID = 'xiaoma-mel-remark-box';
@@ -525,10 +533,6 @@
   const isRawMessageImportPage = location.host === TOOLBOX_HOST &&
     location.pathname === '/raw-message-parser' &&
     new URL(window.location.href).searchParams.has('rawMessageImport');
-
-  if (featureEnabled('ames_bridge') && installToolboxAmesBridge() && !isRawMessageImportPage) {
-    return;
-  }
 
   function cleanText(value) {
     return String(value || '').replace(/\s+/g, ' ').trim();
@@ -5112,23 +5116,54 @@
     if (featureEnabled('airnav_translation')) runWhenDomReady(startDocumentTranslation);
   }
 
-  if (featureEnabled('raw_message_import') && location.host === TOOLBOX_HOST && location.pathname === '/raw-message-parser') {
-    runRawMessageParserImportRelay();
-  } else if (location.hostname === 'ames.juneyaoair.com') {
-    if (isMelManualPage()) {
-      if (featureEnabled('ames_mel_remarks')) runWhenDomReady(startMelRemarkInjection);
-    } else {
-      if (featureEnabled('ames_raw_query_guard')) startRawMessageInitialQueryGuard();
-      if (featureEnabled('enabled')) runWhenDomReady(startAmesEnhancements);
+  function startEnabledFeatures() {
+    if (featureEnabled('ames_bridge') && installToolboxAmesBridge() && !isRawMessageImportPage) return;
+    if (featureEnabled('raw_message_import') && location.host === TOOLBOX_HOST && location.pathname === '/raw-message-parser') {
+      runRawMessageParserImportRelay();
+    } else if (location.hostname === 'ames.juneyaoair.com') {
+      if (isMelManualPage()) {
+        if (featureEnabled('ames_mel_remarks')) runWhenDomReady(startMelRemarkInjection);
+      } else {
+        if (featureEnabled('ames_raw_query_guard')) startRawMessageInitialQueryGuard();
+        if (featureEnabled('enabled')) runWhenDomReady(startAmesEnhancements);
+      }
+    } else if (location.hostname === 'boeingtoolbox.juneyaoair.com' && location.protocol === 'https:') {
+      if (featureEnabled('boeing_translation')) runBoeingToolboxTranslatorHelper();
+    } else if (location.hostname === 'boeingtoolbox.juneyaoair.com') {
+      if (featureEnabled('boeing_auto_continue')) runBoeingToolboxAutoContinue();
+      if (featureEnabled('boeing_translation')) startBoeingToolboxTranslation();
+    } else if (location.hostname === 'airnavx.juneyaoair.com' || location.host === 'airnav.juneyaoair.com:8000') {
+      if (featureEnabled('airnav_pn_format') || featureEnabled('airnav_access_code') || featureEnabled('airnav_translation')) {
+        runAirNavEnhancements();
+      }
     }
-  } else if (location.hostname === 'boeingtoolbox.juneyaoair.com' && location.protocol === 'https:') {
-    if (featureEnabled('boeing_translation')) runBoeingToolboxTranslatorHelper();
-  } else if (location.hostname === 'boeingtoolbox.juneyaoair.com') {
-    if (featureEnabled('boeing_auto_continue')) runBoeingToolboxAutoContinue();
-    if (featureEnabled('boeing_translation')) startBoeingToolboxTranslation();
-  } else if (location.hostname === 'airnavx.juneyaoair.com' || location.host === 'airnav.juneyaoair.com:8000') {
-    if (featureEnabled('airnav_pn_format') || featureEnabled('airnav_access_code') || featureEnabled('airnav_translation')) {
-      runAirNavEnhancements();
+  }
+
+  // Frames wait for the top page's single read, then use the same flags without another request.
+  if (window === window.top) readRemoteConfig(startEnabledFeatures);
+  else {
+    const startedToken = typeof GM_getValue === 'function' ? GM_getValue(CONTROL_STARTED_KEY, '') : '';
+    const readyToken = typeof GM_getValue === 'function' ? GM_getValue(CONTROL_READY_KEY, '') : '';
+    if (!startedToken || startedToken === readyToken || typeof GM_addValueChangeListener !== 'function') {
+      applyRemoteFlags(typeof GM_getValue === 'function' ? GM_getValue(CONTROL_FLAGS_KEY, {}) : remoteFlags);
+      startEnabledFeatures();
+    } else {
+      let started = false;
+      let listenerId;
+      const startFrame = () => {
+        if (started) return;
+        started = true;
+        if (typeof GM_removeValueChangeListener === 'function' && listenerId !== undefined) {
+          GM_removeValueChangeListener(listenerId);
+        }
+        applyRemoteFlags(GM_getValue(CONTROL_FLAGS_KEY, {}));
+        startEnabledFeatures();
+      };
+      listenerId = GM_addValueChangeListener(CONTROL_READY_KEY, (_key, _oldValue, newValue) => {
+        if (newValue === startedToken) startFrame();
+      });
+      if (GM_getValue(CONTROL_READY_KEY, '') === startedToken) startFrame();
+      window.setTimeout(startFrame, 25000);
     }
   }
 })();
